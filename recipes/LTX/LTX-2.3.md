@@ -8,16 +8,17 @@
 - Models:
   - `dg845/LTX-2.3-Diffusers` (full BF16, 30-step)
   - `diffusers/LTX-2.3-Distilled-Diffusers` (Lightricks 8-step distilled, CFG disabled)
-- Task: Text-to-video with synchronized audio generation
+- Task: Text-to-video and image-to-video with synchronized audio generation
 - Mode: Online serving (pure diffusion)
 - Maintainer: @oglok
 
 ## When to use this recipe
 
-Use this recipe when you want to serve LTX-2.3 for text-to-video generation
-with audio. The model generates videos up to 20+ seconds at 768x512 resolution
-with 48kHz audio, all from a single text prompt. Requires a GPU with at least
-96GB VRAM due to the 22B parameter transformer (~44GB weights) plus text
+Use this recipe when you want to serve LTX-2.3 for text-to-video or
+image-to-video generation with audio. The model generates videos up to 20+
+seconds at 768x512 resolution with 48kHz audio from text prompts, and can
+condition video generation on an initial image. Start with a 96GB-class GPU for
+validation because the model combines a 22B parameter transformer with text
 encoder, VAE, and vocoder components.
 
 For latency-bound deployments, use the Lightricks-distilled variant
@@ -26,8 +27,9 @@ steps with CFG=4.0 — same architecture, materially faster, no extra dependenci
 
 ## References
 
-- Full model: <https://huggingface.co/dg845/LTX-2.3-Diffusers>
-- Distilled model: <https://huggingface.co/diffusers/LTX-2.3-Distilled-Diffusers>
+- Upstream raw checkpoints: <https://huggingface.co/Lightricks/LTX-2.3>
+- Diffusers-format checkpoint: <https://huggingface.co/dg845/LTX-2.3-Diffusers>
+- Distilled checkpoint: <https://huggingface.co/diffusers/LTX-2.3-Distilled-Diffusers>
 - Requires `diffusers >= 0.38.0` (install from git: `pip install git+https://github.com/huggingface/diffusers.git`)
 
 ## Serving
@@ -38,6 +40,15 @@ steps with CFG=4.0 — same architecture, materially faster, no extra dependenci
 vllm serve dg845/LTX-2.3-Diffusers \
   --omni \
   --model-class-name LTX23Pipeline \
+  --stage-init-timeout 600
+```
+
+For image-to-video:
+
+```bash
+vllm serve dg845/LTX-2.3-Diffusers \
+  --omni \
+  --model-class-name LTX23ImageToVideoPipeline \
   --stage-init-timeout 600
 ```
 
@@ -56,7 +67,7 @@ Lightricks `DISTILLED_SIGMA_VALUES` schedule. Request-payload overrides for
 these fields are logged and ignored — the schedule and CFG-off contract are
 enforced server-side.
 
-### Verification
+### T2V Verification
 
 ```bash
 # Health check
@@ -106,13 +117,42 @@ curl -X POST http://localhost:8000/v1/videos \
   -F "seed=42"
 ```
 
+### I2V Verification
+
+Start the server with `--model-class-name LTX23ImageToVideoPipeline`, then pass
+an image reference. The I2V pipeline requires `input_reference` or
+`image_reference` because the first frame is the conditioning input.
+
+```bash
+curl http://localhost:8000/health
+
+curl -X POST http://localhost:8000/v1/videos/sync \
+  -F "prompt=A plush toy astronaut gently waving while the camera slowly pushes in." \
+  -F "input_reference=@/absolute/path/to/reference.png" \
+  -F "model=dg845/LTX-2.3-Diffusers" \
+  -F "num_frames=81" \
+  -F "fps=24" \
+  -F "size=768x512" \
+  -F "num_inference_steps=30" \
+  -F "guidance_scale=4.0" \
+  -F "seed=42" \
+  -o ltx23_i2v.mp4
+```
+
 ### Notes
 
-- Memory usage: Model loads at ~36 GiB, peaks at ~62 GiB during inference
+- Memory usage: run a latest-head serving smoke or DFX benchmark on the target
+  GPU before publishing load/peak VRAM numbers.
+- Checkpoint format: use a Diffusers-format checkpoint such as
+  `dg845/LTX-2.3-Diffusers`; the upstream `Lightricks/LTX-2.3` repository ships
+  raw safetensors and does not contain the subfolder configs required by this
+  pipeline loader.
 - Key flags:
-  - `--stage-init-timeout 600`: Required for the initial `torch.compile` warmup (~90-140 seconds on first request)
-  - `--model-class-name LTX23Pipeline`: Selects the LTX-2.3 pipeline (not LTX-2)
+  - `--stage-init-timeout 600`: Gives the initial `torch.compile` warmup enough time on large checkpoints
+  - `--model-class-name LTX23Pipeline`: Selects the LTX-2.3 text-to-video pipeline (not LTX-2)
+  - `--model-class-name LTX23ImageToVideoPipeline`: Selects the LTX-2.3 image-to-video pipeline
   - `--model-class-name LTX23DistilledPipeline`: Selects the Lightricks 8-step distilled variant
+  - `input_reference=@...`: Uploads the I2V reference image directly
 - Audio: 48kHz AAC via BWE vocoder, automatically synced with video
 - CPU offloading: Text encoder (Gemma-3-12B), connectors, VAE, audio VAE, and vocoder stay on CPU and are moved to GPU only when needed
 - Supported resolutions: 768x512, 512x384 (must be divisible by 32)
@@ -122,7 +162,7 @@ curl -X POST http://localhost:8000/v1/videos \
   - CFG is disabled (`guidance_scale=1.0`); `cfg_parallel_size > 1` is not supported
   - `num_inference_steps` and `guidance_scale` request fields are sanitized to the distilled contract (8 / 1.0) with a warning per dropped field
 - Known limitations:
-  - No image-to-video support yet (LTX23ImageToVideoPipeline is a placeholder)
+  - LTX-2.3 I2V currently supports first-frame image conditioning, matching the LTX image-conditioning contract.
   - Requires `diffusers >= 0.38.0` (not yet on PyPI, install from git)
 
 ## Hardware Support
@@ -136,13 +176,16 @@ curl -X POST http://localhost:8000/v1/videos \
 - OS: Ubuntu 22.04
 - Python: 3.10+
 - Driver / runtime: CUDA 13.0, Driver 580.126.09
-- vLLM version: 0.19.x
-- vLLM-Omni version: 0.19.x
+- vLLM version: Match the PR or release checkout being validated
+- vLLM-Omni version or commit: Use the commit you are deploying from
 
-### Validated configurations
+### Benchmarking
 
-| Duration | Frames | Resolution | Steps | Guidance | Inference Time | Peak VRAM |
-|----------|--------|------------|-------|----------|----------------|-----------|
-| 3s | 81 | 768x512 | 30 | 4.0 | ~110s | ~62 GB |
-| 10s | 241 | 768x512 | 30 | 4.0 | ~130s | ~62 GB |
-| 20s | 481 | 768x512 | 30 | 4.0 | ~420s | ~62 GB |
+Do not copy latency or VRAM numbers between commits or machines. Record them
+only after running a latest-head sweep on the target hardware.
+
+For formal PR benchmarking, reuse
+`tests/dfx/perf/tests/test_ltx2_3_vllm_omni.json` with
+`tests/dfx/perf/scripts/run_diffusion_benchmark.py`. That config captures the
+single-device eager baseline and CFG-parallel=2 case for a small 384x512,
+25-frame, 20-step workload.
