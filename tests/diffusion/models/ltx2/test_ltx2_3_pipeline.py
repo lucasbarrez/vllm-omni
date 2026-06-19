@@ -1484,3 +1484,232 @@ class TestLTX23ImageToVideoDistilledPipeline:
         assert captured["sigmas"] is DISTILLED_SIGMA_VALUES
         assert captured["num_inference_steps"] == 8
         assert captured["guidance_scale"] == 1.0
+
+
+class TestLTX2VideoCondition:
+    """Tests for the LTX2VideoCondition dataclass."""
+
+    def test_default_values(self):
+        from vllm_omni.diffusion.models.ltx2.pipeline_ltx2_3 import LTX2VideoCondition
+
+        dummy = SimpleNamespace()  # any object stands in for the frames field
+        cond = LTX2VideoCondition(frames=dummy)
+        assert cond.index == 0
+        assert cond.strength == 1.0
+        assert cond.frames is dummy
+
+
+class TestPreprocessConditions:
+    """Tests for the _preprocess_conditions helper."""
+
+    def _stub_video_processor(self, observed: list):
+        class _StubProcessor:
+            def preprocess_video(self, frames, height, width):
+                observed.append((frames, height, width))
+                tensor = torch.zeros(1)
+                return tensor
+
+        return _StubProcessor()
+
+    def test_empty_conditions_raises(self):
+        from vllm_omni.diffusion.models.ltx2.pipeline_ltx2_3 import _preprocess_conditions
+
+        with pytest.raises(ValueError, match="at least one condition"):
+            _preprocess_conditions(
+                [],
+                self._stub_video_processor([]),
+                height=64,
+                width=64,
+                latent_num_frames=4,
+                device=torch.device("cpu"),
+                dtype=torch.float32,
+            )
+
+    def test_out_of_range_index_raises(self):
+        from vllm_omni.diffusion.models.ltx2.pipeline_ltx2_3 import LTX2VideoCondition, _preprocess_conditions
+
+        with pytest.raises(ValueError, match="outside the valid range"):
+            _preprocess_conditions(
+                [LTX2VideoCondition(frames=SimpleNamespace(), index=10)],
+                self._stub_video_processor([]),
+                height=64,
+                width=64,
+                latent_num_frames=4,
+                device=torch.device("cpu"),
+                dtype=torch.float32,
+            )
+
+    def test_invalid_strength_raises(self):
+        from vllm_omni.diffusion.models.ltx2.pipeline_ltx2_3 import LTX2VideoCondition, _preprocess_conditions
+
+        with pytest.raises(ValueError, match="strength must be in"):
+            _preprocess_conditions(
+                [LTX2VideoCondition(frames=SimpleNamespace(), index=0, strength=1.5)],
+                self._stub_video_processor([]),
+                height=64,
+                width=64,
+                latent_num_frames=4,
+                device=torch.device("cpu"),
+                dtype=torch.float32,
+            )
+
+    def test_negative_index_resolves_against_num_frames(self):
+        from vllm_omni.diffusion.models.ltx2.pipeline_ltx2_3 import LTX2VideoCondition, _preprocess_conditions
+
+        observed: list = []
+        _, _, indices = _preprocess_conditions(
+            [
+                LTX2VideoCondition(frames=SimpleNamespace(), index=0),
+                LTX2VideoCondition(frames=SimpleNamespace(), index=-1),
+            ],
+            self._stub_video_processor(observed),
+            height=64,
+            width=64,
+            latent_num_frames=5,
+            device=torch.device("cpu"),
+            dtype=torch.float32,
+        )
+        assert indices == [0, 4]
+
+
+class TestApplyVisualConditioning:
+    """Tests for the apply_visual_conditioning static method."""
+
+    def test_writes_at_correct_token_offsets(self):
+        from vllm_omni.diffusion.models.ltx2.pipeline_ltx2_3 import LTX23ConditionPipeline
+
+        # Latents: [B=1, seq=10, dim=2]. Use a 5x2 grid (latent_height * latent_width = 10).
+        latents = torch.zeros(1, 10, 2)
+        mask = torch.zeros(1, 10, 1)
+        cond = torch.full((1, 2, 2), 7.0)  # 2 tokens of value 7.0
+
+        latents_out, mask_out, clean_out = LTX23ConditionPipeline.apply_visual_conditioning(
+            latents,
+            mask,
+            condition_latents=[cond],
+            condition_strengths=[1.0],
+            condition_indices=[1],
+            latent_height=1,
+            latent_width=2,
+        )
+
+        # latent_idx=1 * latent_height=1 * latent_width=2 = 2 → tokens [2:4]
+        assert torch.allclose(latents_out[:, 2:4], torch.full((1, 2, 2), 7.0))
+        assert torch.allclose(mask_out[:, 2:4], torch.ones(1, 2, 1))
+        assert torch.allclose(clean_out[:, 2:4], torch.full((1, 2, 2), 7.0))
+        # Outside the conditioned region: unchanged.
+        assert torch.allclose(latents_out[:, :2], torch.zeros(1, 2, 2))
+        assert torch.allclose(latents_out[:, 4:], torch.zeros(1, 6, 2))
+
+
+class TestLTX23ConditionPipeline:
+    """Tests for the LTX-2.3 multi-anchor frame conditioning pipeline."""
+
+    def test_subclasses_ltx23_pipeline(self):
+        from vllm_omni.diffusion.models.ltx2.pipeline_ltx2_3 import LTX23ConditionPipeline, LTX23Pipeline
+
+        assert issubclass(LTX23ConditionPipeline, LTX23Pipeline)
+
+    def test_registered_in_diffusion_models(self):
+        from vllm_omni.diffusion.registry import _DIFFUSION_MODELS
+
+        assert _DIFFUSION_MODELS["LTX23ConditionPipeline"] == (
+            "ltx2",
+            "pipeline_ltx2_3",
+            "LTX23ConditionPipeline",
+        )
+
+    def test_post_process_func_registered(self):
+        from vllm_omni.diffusion.registry import _DIFFUSION_POST_PROCESS_FUNCS
+
+        assert (
+            _DIFFUSION_POST_PROCESS_FUNCS["LTX23ConditionPipeline"]
+            == "get_ltx2_post_process_func"
+        )
+
+    def test_exported_from_ltx2_package(self):
+        from vllm_omni.diffusion.models import ltx2
+
+        for name in ("LTX23ConditionPipeline", "LTX2VideoCondition"):
+            assert hasattr(ltx2, name), f"{name} not exported"
+            assert name in ltx2.__all__, f"{name} not in __all__"
+
+    def test_forward_falls_back_to_t2v_when_no_conditions(self, monkeypatch):
+        """With conditions=None or [], the pipeline behaves like LTX23Pipeline."""
+        from vllm_omni.diffusion.models.ltx2.pipeline_ltx2_3 import LTX23ConditionPipeline, LTX23Pipeline
+
+        called = {}
+
+        def fake_super_forward(self, req, **kwargs):
+            called["yes"] = True
+            return SimpleNamespace(output=("video", "audio"))
+
+        monkeypatch.setattr(LTX23Pipeline, "forward", fake_super_forward)
+
+        pipe = object.__new__(LTX23ConditionPipeline)
+        req = SimpleNamespace()
+
+        pipe.forward(req, conditions=None)
+        assert called == {"yes": True}
+
+        called.clear()
+        pipe.forward(req, conditions=[])
+        assert called == {"yes": True}
+
+    def test_forward_raises_when_conditions_supplied(self):
+        """Until the loop port is GPU-validated, conditioned forward raises."""
+        from vllm_omni.diffusion.models.ltx2.pipeline_ltx2_3 import (
+            LTX23ConditionPipeline,
+            LTX2VideoCondition,
+        )
+
+        pipe = object.__new__(LTX23ConditionPipeline)
+        req = SimpleNamespace()
+
+        with pytest.raises(NotImplementedError, match="awaits GPU validation"):
+            pipe.forward(req, conditions=[LTX2VideoCondition(frames=SimpleNamespace())])
+
+
+class TestLTX23ConditionDistilledPipeline:
+    """Tests for the distilled variant composed via the mixin."""
+
+    def test_subclasses_condition_pipeline(self):
+        from vllm_omni.diffusion.models.ltx2.pipeline_ltx2_3 import (
+            LTX23ConditionDistilledPipeline,
+            LTX23ConditionPipeline,
+        )
+
+        assert issubclass(LTX23ConditionDistilledPipeline, LTX23ConditionPipeline)
+
+    def test_mixin_appears_before_base_in_mro(self):
+        from vllm_omni.diffusion.models.ltx2.distilled_mixin import LightricksDistilledMixin
+        from vllm_omni.diffusion.models.ltx2.pipeline_ltx2_3 import (
+            LTX23ConditionDistilledPipeline,
+            LTX23ConditionPipeline,
+        )
+
+        mro = LTX23ConditionDistilledPipeline.__mro__
+        assert mro.index(LightricksDistilledMixin) < mro.index(LTX23ConditionPipeline)
+
+    def test_registered_in_diffusion_models(self):
+        from vllm_omni.diffusion.registry import _DIFFUSION_MODELS
+
+        assert _DIFFUSION_MODELS["LTX23ConditionDistilledPipeline"] == (
+            "ltx2",
+            "pipeline_ltx2_3",
+            "LTX23ConditionDistilledPipeline",
+        )
+
+    def test_post_process_func_registered(self):
+        from vllm_omni.diffusion.registry import _DIFFUSION_POST_PROCESS_FUNCS
+
+        assert (
+            _DIFFUSION_POST_PROCESS_FUNCS["LTX23ConditionDistilledPipeline"]
+            == "get_ltx2_post_process_func"
+        )
+
+    def test_exported_from_ltx2_package(self):
+        from vllm_omni.diffusion.models import ltx2
+
+        assert hasattr(ltx2, "LTX23ConditionDistilledPipeline")
+        assert "LTX23ConditionDistilledPipeline" in ltx2.__all__

@@ -2168,3 +2168,283 @@ class LTX23ImageToVideoDistilledPipeline(LightricksDistilledMixin, LTX23ImageToV
     (first-frame latent preservation, request parsing) is inherited from
     :class:`LTX23ImageToVideoPipeline`.
     """
+
+
+# ----------------------------------------------------------------------------
+# Multi-anchor frame conditioning (FLF2V / FMLF)
+# ----------------------------------------------------------------------------
+
+
+@dataclass
+class LTX2VideoCondition:
+    """A single frame-conditioning item for LTX-2.3 video generation.
+
+    Ports the Diffusers ``LTX2VideoCondition`` dataclass (see
+    ``diffusers.pipelines.ltx2.pipeline_ltx2_condition``). Used by
+    :class:`LTX23ConditionPipeline` for FLF2V (first-last-frame) and
+    FMLF (first-middle-last-frame) workflows.
+
+    Attributes:
+        frames: The image (or video) to condition on. PIL, list-of-PIL,
+            numpy array, or ``torch.Tensor`` accepted — anything
+            ``VideoProcessor.preprocess_video`` handles.
+        index: The frame index at which the condition is applied. May be
+            negative (``-1`` = last frame).
+        strength: Conditioning strength in ``[0, 1]``. ``1.0`` = fully
+            applied.
+    """
+
+    frames: PIL.Image.Image | list[PIL.Image.Image] | np.ndarray | torch.Tensor
+    index: int = 0
+    strength: float = 1.0
+
+
+def _preprocess_conditions(
+    conditions: list[LTX2VideoCondition],
+    video_processor: VideoProcessor,
+    height: int,
+    width: int,
+    latent_num_frames: int,
+    *,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> tuple[list[torch.Tensor], list[float], list[int]]:
+    """Validate and preprocess a list of :class:`LTX2VideoCondition` items.
+
+    Returns a triplet of parallel lists ``(frames_tensors, strengths, indices)``.
+    Negative ``index`` values are resolved against ``latent_num_frames``.
+
+    Raises ``ValueError`` for empty input, out-of-range indices, or strengths
+    outside ``[0, 1]``.
+    """
+    if not conditions:
+        raise ValueError("LTX23ConditionPipeline requires at least one condition.")
+
+    frames_tensors: list[torch.Tensor] = []
+    strengths: list[float] = []
+    indices: list[int] = []
+    for cond in conditions:
+        if not 0.0 <= cond.strength <= 1.0:
+            raise ValueError(f"Condition strength must be in [0, 1], got {cond.strength}.")
+        resolved = cond.index if cond.index >= 0 else latent_num_frames + cond.index
+        if not 0 <= resolved < latent_num_frames:
+            raise ValueError(
+                f"Condition index {cond.index} resolves to {resolved}, "
+                f"outside the valid range [0, {latent_num_frames})."
+            )
+        frames_tensor = video_processor.preprocess_video(cond.frames, height=height, width=width).to(
+            device=device, dtype=dtype
+        )
+        frames_tensors.append(frames_tensor)
+        strengths.append(float(cond.strength))
+        indices.append(resolved)
+    return frames_tensors, strengths, indices
+
+
+class LTX23ConditionPipeline(LTX23Pipeline):
+    """LTX-2.3 multi-anchor frame conditioning pipeline (FLF2V / FMLF).
+
+    Accepts a list of :class:`LTX2VideoCondition` items, each specifying a
+    frame (or sequence of frames) to anchor at a given index with a given
+    strength. The denoising loop preserves the conditioned tokens by masking
+    their per-token timestep:
+    ``video_timestep = timestep * (1 - conditioning_mask)``.
+
+    This is the FLF2V (first-last-frame) and FMLF (first-middle-last-frame)
+    path used by LTX-2.3 production workflows. Mirrors the Diffusers
+    ``LTX2ConditionPipeline`` algorithm but reuses the vLLM-Omni LTX-2.3
+    prompt connector, x0-space CFG, and audio branch from
+    :class:`LTX23Pipeline`.
+
+    Scope notes:
+
+    - Advanced guidance modes from the Diffusers reference (Spatio-Temporal
+      Guidance, modality isolation guidance, separate audio guidance) are
+      intentionally NOT ported in this initial version. See
+      ``docs/ltx-2.3/07-vllm-omni-condition-port-plan.md``.
+    - When called with ``conditions=None``, the pipeline behaves exactly
+      like :class:`LTX23Pipeline` (pure T2V). This lets the variant be
+      registered safely before the conditioned denoising path is wired.
+    """
+
+    support_image_input = True
+
+    def __init__(self, *, od_config: OmniDiffusionConfig, prefix: str = ""):
+        super().__init__(od_config=od_config, prefix=prefix)
+        # Bilinear resampling for condition frames (matches I2V).
+        self.video_processor = VideoProcessor(
+            vae_scale_factor=self.vae_spatial_compression_ratio, resample="bilinear"
+        )
+
+    @staticmethod
+    def apply_visual_conditioning(
+        latents: torch.Tensor,
+        conditioning_mask: torch.Tensor,
+        condition_latents: list[torch.Tensor],
+        condition_strengths: list[float],
+        condition_indices: list[int],
+        *,
+        latent_height: int,
+        latent_width: int,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Overwrite ``latents`` and ``conditioning_mask`` at the conditioned
+        token indices and build the parallel ``clean_latents`` tensor.
+
+        Returns ``(latents, conditioning_mask, clean_latents)``. The
+        formulation matches Diffusers'
+        ``LTX2ConditionPipeline.apply_visual_conditioning``.
+        """
+        clean_latents = torch.zeros_like(latents)
+        for cond, strength, latent_idx in zip(
+            condition_latents, condition_strengths, condition_indices, strict=True
+        ):
+            num_cond_tokens = cond.size(1)
+            start_token_idx = latent_idx * latent_height * latent_width
+            end_token_idx = start_token_idx + num_cond_tokens
+            latents[:, start_token_idx:end_token_idx] = cond
+            conditioning_mask[:, start_token_idx:end_token_idx] = strength
+            clean_latents[:, start_token_idx:end_token_idx] = cond
+        return latents, conditioning_mask, clean_latents
+
+    def prepare_latents(
+        self,
+        conditions: list[LTX2VideoCondition] | None = None,
+        batch_size: int = 1,
+        num_channels_latents: int = 128,
+        height: int = 512,
+        width: int = 768,
+        num_frames: int = 121,
+        noise_scale: float = 1.0,
+        dtype: torch.dtype | None = None,
+        device: torch.device | None = None,
+        generator: torch.Generator | None = None,
+        latents: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Prepare condition-injected latents and the conditioning mask.
+
+        Returns ``(latents, conditioning_mask, clean_latents)``. Caller-
+        provided ``latents`` are normalized and packed before the conditions
+        are applied; otherwise we start from zeros and mix Gaussian noise in
+        according to ``(1 - conditioning_mask) * noise_scale``.
+        """
+        latent_height = height // self.vae_spatial_compression_ratio
+        latent_width = width // self.vae_spatial_compression_ratio
+        latent_num_frames = (num_frames - 1) // self.vae_temporal_compression_ratio + 1
+
+        shape = (batch_size, num_channels_latents, latent_num_frames, latent_height, latent_width)
+        mask_shape = (batch_size, 1, latent_num_frames, latent_height, latent_width)
+
+        if latents is not None:
+            latents = self._normalize_latents(
+                latents, self.vae.latents_mean, self.vae.latents_std, self.vae.config.scaling_factor
+            )
+        else:
+            # Zero init; standard Gaussian noise is mixed in below according to
+            # (1 - conditioning_mask) so condition regions stay clean.
+            latents = torch.zeros(shape, device=device, dtype=dtype)
+
+        conditioning_mask = latents.new_zeros(mask_shape)
+        latents = self._pack_latents(
+            latents, self.transformer_spatial_patch_size, self.transformer_temporal_patch_size
+        )
+        conditioning_mask = self._pack_latents(
+            conditioning_mask, self.transformer_spatial_patch_size, self.transformer_temporal_patch_size
+        )
+
+        if isinstance(generator, list):
+            generator = generator[0]
+
+        if conditions:
+            condition_frames, condition_strengths, condition_indices = _preprocess_conditions(
+                conditions,
+                self.video_processor,
+                height,
+                width,
+                latent_num_frames,
+                device=device,
+                dtype=dtype,
+            )
+            condition_latents: list[torch.Tensor] = []
+            for condition_tensor in condition_frames:
+                condition_latent = retrieve_latents(
+                    self.vae.encode(condition_tensor), generator=generator, sample_mode="argmax"
+                )
+                condition_latent = self._normalize_latents(
+                    condition_latent, self.vae.latents_mean, self.vae.latents_std
+                ).to(device=device, dtype=dtype)
+                condition_latent = self._pack_latents(
+                    condition_latent,
+                    self.transformer_spatial_patch_size,
+                    self.transformer_temporal_patch_size,
+                )
+                condition_latents.append(condition_latent)
+
+            latents, conditioning_mask, clean_latents = self.apply_visual_conditioning(
+                latents,
+                conditioning_mask,
+                condition_latents,
+                condition_strengths,
+                condition_indices,
+                latent_height=latent_height,
+                latent_width=latent_width,
+            )
+        else:
+            clean_latents = torch.zeros_like(latents)
+
+        noise = randn_tensor(latents.shape, generator=generator, device=latents.device, dtype=latents.dtype)
+        scaled_mask = (1.0 - conditioning_mask) * noise_scale
+        latents = noise * scaled_mask + latents * (1 - scaled_mask)
+
+        return latents, conditioning_mask, clean_latents
+
+    def forward(
+        self,
+        req: OmniDiffusionRequest,
+        conditions: list[LTX2VideoCondition] | None = None,
+        **kwargs: Any,
+    ) -> DiffusionOutput:
+        """LTX-2.3 multi-anchor conditional forward.
+
+        Two changes vs ``LTX23Pipeline.forward`` (the rest is identical):
+
+        1. ``prepare_latents`` returns a triplet
+           ``(latents, conditioning_mask, clean_latents)`` instead of just
+           ``latents``.
+        2. In the denoising loop, the per-token video timestep is masked:
+           ``video_timestep = t * (1 - conditioning_mask.squeeze(-1))``.
+
+        With ``conditions=None`` (or empty), the pipeline falls back to the
+        pure T2V path of :class:`LTX23Pipeline`, which lets the variant be
+        registered safely before the conditioned denoising path is wired.
+
+        With non-empty ``conditions``, this method currently raises
+        :class:`NotImplementedError`. The full denoising-loop port (the
+        2-line surgical change above, applied to ~500 LOC of T2V forward
+        body) is gated on a GPU validation pass — see
+        ``docs/ltx-2.3/07-vllm-omni-condition-port-plan.md``.
+        """
+        if not conditions:
+            return super().forward(req, **kwargs)
+
+        # TODO(condition): port the conditioned denoising loop. The surgical
+        # diff vs LTX23Pipeline.forward is documented in
+        # docs/ltx-2.3/07-vllm-omni-condition-port-plan.md §3.4. We
+        # intentionally do not ship a half-validated port; the helpers
+        # above (prepare_latents, apply_visual_conditioning,
+        # _preprocess_conditions) ARE testable in isolation and provide the
+        # full algorithmic substrate for the loop port.
+        raise NotImplementedError(
+            "LTX23ConditionPipeline.forward with non-empty conditions awaits "
+            "GPU validation. See docs/ltx-2.3/07-vllm-omni-condition-port-plan.md."
+        )
+
+
+class LTX23ConditionDistilledPipeline(LightricksDistilledMixin, LTX23ConditionPipeline):
+    """LTX-2.3 8-step Lightricks-distilled multi-anchor conditioning variant.
+
+    Composes the distilled defaults from :class:`LightricksDistilledMixin`
+    with the multi-anchor FLF2V / FMLF logic from
+    :class:`LTX23ConditionPipeline`. Inherits the conditioned ``forward``
+    gating (raises ``NotImplementedError`` when conditions are supplied,
+    until the loop port is GPU-validated).
+    """
