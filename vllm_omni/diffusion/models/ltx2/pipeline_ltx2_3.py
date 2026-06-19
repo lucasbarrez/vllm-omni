@@ -2157,3 +2157,14 @@ class LTX23DistilledPipeline(LightricksDistilledMixin, LTX23Pipeline):
     are injected by :class:`LightricksDistilledMixin`; everything else is
     inherited unchanged from :class:`LTX23Pipeline`.
     """
+
+
+class LTX23ImageToVideoDistilledPipeline(LightricksDistilledMixin, LTX23ImageToVideoPipeline):
+    """LTX-2.3 8-step Lightricks-distilled I2V variant.
+
+    Targets ``diffusers/LTX-2.3-Distilled-Diffusers`` with an input image as
+    the first-frame condition. Distilled defaults are injected by
+    :class:`LightricksDistilledMixin`; the full I2V conditioning logic
+    (first-frame latent preservation, request parsing) is inherited from
+    :class:`LTX23ImageToVideoPipeline`.
+    """

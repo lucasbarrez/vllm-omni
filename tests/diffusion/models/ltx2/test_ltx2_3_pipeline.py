@@ -1407,3 +1407,80 @@ class TestLTX23DistilledPipeline:
         assert captured["sigmas"] is DISTILLED_SIGMA_VALUES
         assert captured["num_inference_steps"] == 8
         assert captured["guidance_scale"] == 1.0
+
+
+class TestLTX23ImageToVideoDistilledPipeline:
+    """Tests for the LTX-2.3 Lightricks-distilled I2V variant.
+
+    Same shape as :class:`TestLTX23DistilledPipeline` — verifies that the
+    reusable mixin composes cleanly on top of the real I2V base.
+    """
+
+    def test_subclasses_ltx23_image_to_video_pipeline(self):
+        from vllm_omni.diffusion.models.ltx2.pipeline_ltx2_3 import (
+            LTX23ImageToVideoDistilledPipeline,
+            LTX23ImageToVideoPipeline,
+        )
+
+        assert issubclass(LTX23ImageToVideoDistilledPipeline, LTX23ImageToVideoPipeline)
+
+    def test_mixin_appears_before_base_in_mro(self):
+        from vllm_omni.diffusion.models.ltx2.distilled_mixin import LightricksDistilledMixin
+        from vllm_omni.diffusion.models.ltx2.pipeline_ltx2_3 import (
+            LTX23ImageToVideoDistilledPipeline,
+            LTX23ImageToVideoPipeline,
+        )
+
+        mro = LTX23ImageToVideoDistilledPipeline.__mro__
+        assert mro.index(LightricksDistilledMixin) < mro.index(LTX23ImageToVideoPipeline)
+
+    def test_registered_in_diffusion_models(self):
+        from vllm_omni.diffusion.registry import _DIFFUSION_MODELS
+
+        assert _DIFFUSION_MODELS["LTX23ImageToVideoDistilledPipeline"] == (
+            "ltx2",
+            "pipeline_ltx2_3",
+            "LTX23ImageToVideoDistilledPipeline",
+        )
+
+    def test_post_process_func_registered(self):
+        from vllm_omni.diffusion.registry import _DIFFUSION_POST_PROCESS_FUNCS
+
+        assert (
+            _DIFFUSION_POST_PROCESS_FUNCS["LTX23ImageToVideoDistilledPipeline"]
+            == "get_ltx2_post_process_func"
+        )
+
+    def test_exported_from_ltx2_package(self):
+        from vllm_omni.diffusion.models import ltx2
+
+        assert hasattr(ltx2, "LTX23ImageToVideoDistilledPipeline")
+        assert "LTX23ImageToVideoDistilledPipeline" in ltx2.__all__
+
+    def test_forward_injects_distilled_defaults_via_mixin(self, monkeypatch):
+        """Defaults flow through LTX23ImageToVideoPipeline.forward via the mixin's super() call."""
+        from diffusers.pipelines.ltx2.utils import DISTILLED_SIGMA_VALUES
+
+        from vllm_omni.diffusion.models.ltx2.pipeline_ltx2_3 import (
+            LTX23ImageToVideoDistilledPipeline,
+            LTX23ImageToVideoPipeline,
+        )
+
+        captured: dict = {}
+
+        def fake_super_forward(self, req, sigmas=None, num_inference_steps=None, guidance_scale=4.0, **kwargs):
+            captured["sigmas"] = sigmas
+            captured["num_inference_steps"] = num_inference_steps
+            captured["guidance_scale"] = guidance_scale
+            return SimpleNamespace(output=("video", "audio"))
+
+        monkeypatch.setattr(LTX23ImageToVideoPipeline, "forward", fake_super_forward)
+
+        pipe = object.__new__(LTX23ImageToVideoDistilledPipeline)
+        req = SimpleNamespace(sampling_params=SimpleNamespace(guidance_scale_provided=False))
+
+        pipe.forward(req)
+
+        assert captured["sigmas"] is DISTILLED_SIGMA_VALUES
+        assert captured["num_inference_steps"] == 8
+        assert captured["guidance_scale"] == 1.0
