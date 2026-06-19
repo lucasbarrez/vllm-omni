@@ -52,6 +52,7 @@ from vllm_omni.diffusion.offloader.module_collector import ModuleDiscovery
 from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import DiffusionPipelineProfilerMixin
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 
+from .distilled_mixin import LightricksDistilledMixin
 from .pipeline_ltx2 import (
     _get_prompt_field,
     _VideoAudioScheduler,
@@ -1292,3 +1293,13 @@ class LTX23ImageToVideoPipeline(nn.Module):
             "LTX23ImageToVideoPipeline is not yet implemented. "
             "Use LTX23Pipeline for single-stage text-to-video generation."
         )
+
+
+class LTX23DistilledPipeline(LightricksDistilledMixin, LTX23Pipeline):
+    """LTX-2.3 8-step Lightricks-distilled T2V variant.
+
+    Targets ``diffusers/LTX-2.3-Distilled-Diffusers``. Distilled defaults
+    (``DISTILLED_SIGMA_VALUES``, 8 inference steps, ``guidance_scale=1.0``)
+    are injected by :class:`LightricksDistilledMixin`; everything else is
+    inherited unchanged from :class:`LTX23Pipeline`.
+    """

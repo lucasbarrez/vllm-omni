@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from vllm_omni.diffusion.models.ltx2.distilled_mixin import LightricksDistilledMixin
 from vllm_omni.diffusion.models.ltx2.ltx2_transformer import LTX2VideoTransformer3DModel
 from vllm_omni.diffusion.models.ltx2.pipeline_ltx2 import (
     LTX2Pipeline,
@@ -11,6 +12,7 @@ from vllm_omni.diffusion.models.ltx2.pipeline_ltx2 import (
     load_transformer_config,
 )
 from vllm_omni.diffusion.models.ltx2.pipeline_ltx2_3 import (
+    LTX23DistilledPipeline,
     LTX23ImageToVideoPipeline,
     LTX23Pipeline,
 )
@@ -31,6 +33,8 @@ __all__ = [
     "LTX2ImageToVideoTwoStagesPipeline",
     "LTX23Pipeline",
     "LTX23ImageToVideoPipeline",
+    "LTX23DistilledPipeline",
+    "LightricksDistilledMixin",
     "get_ltx2_post_process_func",
     "load_transformer_config",
     "create_transformer_from_config",

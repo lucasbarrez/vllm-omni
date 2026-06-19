@@ -913,3 +913,133 @@ class TestAudioLatentSPPadding:
                 device=torch.device("cpu"),
                 latents=latents,
             )
+
+
+class TestLightricksDistilledMixin:
+    """Tests for the reusable Lightricks step-distillation mixin.
+
+    Verifies that the mixin alone (composed with any base) injects the
+    distilled defaults correctly. This is what guarantees future LTX-2.3 mode
+    pipelines (I2V, Condition, ...) can derive a distilled variant in 3 lines.
+    """
+
+    def test_mixin_exported_from_ltx2_package(self):
+        from vllm_omni.diffusion.models import ltx2
+
+        assert hasattr(ltx2, "LightricksDistilledMixin")
+        assert "LightricksDistilledMixin" in ltx2.__all__
+
+    def test_mixin_injects_defaults_on_arbitrary_base(self):
+        """Compose the mixin with a stub base; defaults must flow to super().forward."""
+        from diffusers.pipelines.ltx2.utils import DISTILLED_SIGMA_VALUES
+
+        from vllm_omni.diffusion.models.ltx2.distilled_mixin import LightricksDistilledMixin
+
+        captured: dict = {}
+
+        class _Base:
+            def forward(self, req, sigmas=None, num_inference_steps=None, guidance_scale=4.0, **kwargs):
+                captured["sigmas"] = sigmas
+                captured["num_inference_steps"] = num_inference_steps
+                captured["guidance_scale"] = guidance_scale
+                return SimpleNamespace(output=("v", "a"))
+
+        class _Composed(LightricksDistilledMixin, _Base):
+            pass
+
+        req = SimpleNamespace(sampling_params=SimpleNamespace(guidance_scale_provided=False))
+        _Composed().forward(req)
+
+        assert captured["sigmas"] is DISTILLED_SIGMA_VALUES
+        assert captured["num_inference_steps"] == 8
+        assert captured["guidance_scale"] == 1.0
+
+    def test_mixin_kwargs_override_defaults_on_arbitrary_base(self):
+        from vllm_omni.diffusion.models.ltx2.distilled_mixin import LightricksDistilledMixin
+
+        captured: dict = {}
+
+        class _Base:
+            def forward(self, req, sigmas=None, num_inference_steps=None, guidance_scale=4.0, **kwargs):
+                captured["sigmas"] = sigmas
+                captured["num_inference_steps"] = num_inference_steps
+                captured["guidance_scale"] = guidance_scale
+                return SimpleNamespace(output=("v", "a"))
+
+        class _Composed(LightricksDistilledMixin, _Base):
+            pass
+
+        req = SimpleNamespace(sampling_params=SimpleNamespace(guidance_scale_provided=False))
+        _Composed().forward(req, sigmas=[0.9, 0.4], num_inference_steps=12, guidance_scale=3.5)
+
+        assert captured["sigmas"] == [0.9, 0.4]
+        assert captured["num_inference_steps"] == 12
+        assert captured["guidance_scale"] == 3.5
+
+
+class TestLTX23DistilledPipeline:
+    """Tests for the LTX-2.3 Lightricks-distilled T2V variant.
+
+    Covers registry wiring, package exports, MRO ordering, and the inherited
+    default injection behavior — most of the forward-behavior coverage lives
+    in :class:`TestLightricksDistilledMixin`.
+    """
+
+    def test_subclasses_ltx23_pipeline(self):
+        from vllm_omni.diffusion.models.ltx2.pipeline_ltx2_3 import LTX23DistilledPipeline, LTX23Pipeline
+
+        assert issubclass(LTX23DistilledPipeline, LTX23Pipeline)
+
+    def test_mixin_appears_before_base_in_mro(self):
+        """LightricksDistilledMixin must be in front of LTX23Pipeline so its
+        forward() wins resolution and the super() chain reaches the base."""
+        from vllm_omni.diffusion.models.ltx2.distilled_mixin import LightricksDistilledMixin
+        from vllm_omni.diffusion.models.ltx2.pipeline_ltx2_3 import LTX23DistilledPipeline, LTX23Pipeline
+
+        mro = LTX23DistilledPipeline.__mro__
+        assert mro.index(LightricksDistilledMixin) < mro.index(LTX23Pipeline)
+
+    def test_registered_in_diffusion_models(self):
+        from vllm_omni.diffusion.registry import _DIFFUSION_MODELS
+
+        assert _DIFFUSION_MODELS["LTX23DistilledPipeline"] == (
+            "ltx2",
+            "pipeline_ltx2_3",
+            "LTX23DistilledPipeline",
+        )
+
+    def test_post_process_func_registered(self):
+        from vllm_omni.diffusion.registry import _DIFFUSION_POST_PROCESS_FUNCS
+
+        assert _DIFFUSION_POST_PROCESS_FUNCS["LTX23DistilledPipeline"] == "get_ltx2_post_process_func"
+
+    def test_exported_from_ltx2_package(self):
+        from vllm_omni.diffusion.models import ltx2
+
+        assert hasattr(ltx2, "LTX23DistilledPipeline")
+        assert "LTX23DistilledPipeline" in ltx2.__all__
+
+    def test_forward_injects_distilled_defaults_via_mixin(self, monkeypatch):
+        """Defaults flow through LTX23Pipeline.forward via the mixin's super() call."""
+        from diffusers.pipelines.ltx2.utils import DISTILLED_SIGMA_VALUES
+
+        from vllm_omni.diffusion.models.ltx2.pipeline_ltx2_3 import LTX23DistilledPipeline, LTX23Pipeline
+
+        captured: dict = {}
+
+        def fake_super_forward(self, req, sigmas=None, num_inference_steps=None, guidance_scale=4.0, **kwargs):
+            captured["sigmas"] = sigmas
+            captured["num_inference_steps"] = num_inference_steps
+            captured["guidance_scale"] = guidance_scale
+            return SimpleNamespace(output=("video", "audio"))
+
+        monkeypatch.setattr(LTX23Pipeline, "forward", fake_super_forward)
+
+        pipe = object.__new__(LTX23DistilledPipeline)
+        req = SimpleNamespace(sampling_params=SimpleNamespace(guidance_scale_provided=False))
+
+        pipe.forward(req)
+
+        assert captured["sigmas"] is DISTILLED_SIGMA_VALUES
+        assert captured["num_inference_steps"] == 8
+        assert captured["guidance_scale"] == 1.0
