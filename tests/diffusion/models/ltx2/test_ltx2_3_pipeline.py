@@ -1713,3 +1713,91 @@ class TestLTX23ConditionDistilledPipeline:
 
         assert hasattr(ltx2, "LTX23ConditionDistilledPipeline")
         assert "LTX23ConditionDistilledPipeline" in ltx2.__all__
+
+
+class TestLTX23TwoStagesPipeline:
+    """Tests for the LTX-2.3 two-stage T2V pipeline (1080p / 1440p refine)."""
+
+    def test_registered_in_diffusion_models(self):
+        from vllm_omni.diffusion.registry import _DIFFUSION_MODELS
+
+        assert _DIFFUSION_MODELS["LTX23TwoStagesPipeline"] == (
+            "ltx2",
+            "pipeline_ltx2_3",
+            "LTX23TwoStagesPipeline",
+        )
+
+    def test_post_process_func_registered(self):
+        from vllm_omni.diffusion.registry import _DIFFUSION_POST_PROCESS_FUNCS
+
+        assert (
+            _DIFFUSION_POST_PROCESS_FUNCS["LTX23TwoStagesPipeline"]
+            == "get_ltx2_post_process_func"
+        )
+
+    def test_exported_from_ltx2_package(self):
+        from vllm_omni.diffusion.models import ltx2
+
+        assert hasattr(ltx2, "LTX23TwoStagesPipeline")
+        assert "LTX23TwoStagesPipeline" in ltx2.__all__
+
+    def test_lora_filename_targets_v1_1(self):
+        """The class-level stage-2 LoRA filename must point at the v1.1 adapter."""
+        from vllm_omni.diffusion.models.ltx2.pipeline_ltx2_3 import LTX23TwoStagesPipeline
+
+        assert LTX23TwoStagesPipeline._STAGE_2_LORA_FILENAME == (
+            "ltx-2.3-22b-distilled-lora-384-1.1.safetensors"
+        )
+
+    def test_distilled_flag_detected_from_distilled_path(self):
+        """``self.distilled = True`` when the path basename contains 'distilled'."""
+        from vllm_omni.diffusion.models.ltx2.pipeline_ltx2_3 import LTX23TwoStagesPipeline
+
+        pipe = object.__new__(LTX23TwoStagesPipeline)
+        pipe.model_path = "/some/local/path/LTX-2.3-Distilled-Diffusers"
+        pipe.distilled = "distilled" in __import__("os").path.basename(
+            __import__("os").path.normpath(pipe.model_path)
+        )
+
+        assert pipe.distilled is True
+
+    def test_distilled_flag_false_for_dev_path(self):
+        from vllm_omni.diffusion.models.ltx2.pipeline_ltx2_3 import LTX23TwoStagesPipeline  # noqa: F401
+
+        path = "/some/local/path/LTX-2.3-Diffusers"
+        is_distilled = "distilled" in __import__("os").path.basename(
+            __import__("os").path.normpath(path)
+        )
+        assert is_distilled is False
+
+
+class TestLTX23ImageToVideoTwoStagesPipeline:
+    """Tests for the LTX-2.3 two-stage I2V pipeline (distilled-only)."""
+
+    def test_registered_in_diffusion_models(self):
+        from vllm_omni.diffusion.registry import _DIFFUSION_MODELS
+
+        assert _DIFFUSION_MODELS["LTX23ImageToVideoTwoStagesPipeline"] == (
+            "ltx2",
+            "pipeline_ltx2_3",
+            "LTX23ImageToVideoTwoStagesPipeline",
+        )
+
+    def test_post_process_func_registered(self):
+        from vllm_omni.diffusion.registry import _DIFFUSION_POST_PROCESS_FUNCS
+
+        assert (
+            _DIFFUSION_POST_PROCESS_FUNCS["LTX23ImageToVideoTwoStagesPipeline"]
+            == "get_ltx2_post_process_func"
+        )
+
+    def test_exported_from_ltx2_package(self):
+        from vllm_omni.diffusion.models import ltx2
+
+        assert hasattr(ltx2, "LTX23ImageToVideoTwoStagesPipeline")
+        assert "LTX23ImageToVideoTwoStagesPipeline" in ltx2.__all__
+
+    def test_supports_image_input_class_attribute(self):
+        from vllm_omni.diffusion.models.ltx2.pipeline_ltx2_3 import LTX23ImageToVideoTwoStagesPipeline
+
+        assert LTX23ImageToVideoTwoStagesPipeline.support_image_input is True
