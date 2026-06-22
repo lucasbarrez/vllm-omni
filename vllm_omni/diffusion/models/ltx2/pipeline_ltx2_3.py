@@ -2497,7 +2497,7 @@ class LTX23TwoStagesPipeline(nn.Module, SupportsComponentDiscovery):
         self.device = get_local_device()
         self.dtype = getattr(od_config, "dtype", torch.bfloat16)
         self.model_path = od_config.model
-        self.distilled = "distilled" in os.path.basename(os.path.normpath(self.model_path))
+        self.distilled = "distilled" in os.path.basename(os.path.normpath(self.model_path)).lower()
 
         self.pipe = LTX23Pipeline(od_config=od_config, prefix=prefix)
         self.upsample_pipe = LTX2LatentUpsamplePipeline(vae=self.pipe.vae, od_config=od_config)
@@ -2651,7 +2651,7 @@ class LTX23ImageToVideoTwoStagesPipeline(nn.Module, SupportsComponentDiscovery):
         self.dtype = getattr(od_config, "dtype", torch.bfloat16)
         self.model_path = od_config.model
 
-        if "distilled" not in os.path.basename(os.path.normpath(self.model_path)):
+        if "distilled" not in os.path.basename(os.path.normpath(self.model_path)).lower():
             raise NotImplementedError(
                 f"{self.model_path} is not supported for {self.__class__.__name__}: "
                 "LTX-2.3 I2V two-stage currently requires a distilled checkpoint."
