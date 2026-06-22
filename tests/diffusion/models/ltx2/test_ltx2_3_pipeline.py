@@ -1333,6 +1333,46 @@ class TestLightricksDistilledMixin:
 
         assert not [r for r in caplog.records if r.levelname == "WARNING"]
 
+    def test_mixin_bypasses_sanitize_for_engine_warmup_dummy_run(self, caplog):
+        """The engine's internal dummy warmup pass uses num_inference_steps=1
+        and guidance_scale=0.0 on purpose to keep cold-start cheap. The mixin
+        must NOT sanitize that path — forcing 8 steps would multiply warmup
+        cost without benefit, and the warning would mislead users into
+        thinking a client sent num_steps=1."""
+        from vllm_omni.diffusion.models.ltx2.distilled_mixin import LightricksDistilledMixin
+
+        captured: dict = {}
+
+        class _Base:
+            def forward(self, req, sigmas=None, num_inference_steps=None, guidance_scale=4.0, **kwargs):
+                captured["sigmas"] = sigmas
+                captured["num_inference_steps"] = num_inference_steps
+                captured["guidance_scale"] = guidance_scale
+                captured["req_num_steps"] = req.sampling_params.num_inference_steps
+                captured["req_guidance"] = req.sampling_params.guidance_scale
+                return SimpleNamespace(output=("v", "a"))
+
+        class _Composed(LightricksDistilledMixin, _Base):
+            pass
+
+        # Mirror what DiffusionEngine._dummy_run constructs.
+        req = SimpleNamespace(
+            sampling_params=self._make_sampling_params(num_inference_steps=1, guidance_scale=0.0),
+            is_dummy_run=lambda: True,
+        )
+
+        with caplog.at_level("WARNING", logger="vllm_omni.diffusion.models.ltx2.distilled_mixin"):
+            _Composed().forward(req, num_inference_steps=1, guidance_scale=0.0)
+
+        # No warnings: the warmup path is exempt by design.
+        assert not [r for r in caplog.records if r.levelname == "WARNING"]
+        # Sanitize was skipped: the request keeps its warmup-minimal values.
+        assert captured["req_num_steps"] == 1
+        assert captured["req_guidance"] == 0.0
+        # Base receives the warmup's own kwargs untouched (mixin did not force 8 / 1.0).
+        assert captured["num_inference_steps"] == 1
+        assert captured["guidance_scale"] == 0.0
+
 
 class TestLTX23DistilledPipeline:
     """Tests for the LTX-2.3 Lightricks-distilled T2V variant.

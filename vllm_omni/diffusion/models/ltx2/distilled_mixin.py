@@ -89,6 +89,14 @@ class LightricksDistilledMixin:
         sigmas: list[float] | None = None,
         **kwargs: Any,
     ) -> DiffusionOutput:
+        # The engine's internal warmup pass uses a minimal config
+        # (``num_inference_steps=1``, ``guidance_scale=0.0``) on purpose to
+        # keep cold-start cheap. Skip sanitize for it — forcing 8 steps would
+        # multiply warmup cost without benefit, and the warning would
+        # otherwise mislead users into thinking a client sent num_steps=1.
+        if req.is_dummy_run():
+            return super().forward(req, sigmas=sigmas, **kwargs)
+
         self._sanitize_lightricks_request(req)
         kwargs.pop("num_inference_steps", None)
         kwargs.pop("guidance_scale", None)
