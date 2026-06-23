@@ -406,6 +406,57 @@ class TestLTX23ImageToVideoPipeline:
         assert out is sentinel_latents
         assert pipe._conditioning_mask is sentinel_mask
 
+    def test_i2v_prepare_image_to_video_latents_casts_image_to_vae_dtype(self, monkeypatch):
+        """The image must be cast to vae.dtype before vae.encode.
+
+        Regression: passing the latent dtype (typically float32) here trips
+        the VAE conv layers with "Input type (float) and bias type
+        (c10::BFloat16) should be the same" at engine warmup.
+        """
+        from vllm_omni.diffusion.models.ltx2 import pipeline_ltx2_3 as ltx23
+
+        pipe = object.__new__(ltx23.LTX23ImageToVideoPipeline)
+        torch.nn.Module.__init__(pipe)
+        pipe.vae_spatial_compression_ratio = 32
+        pipe.vae_temporal_compression_ratio = 1
+        pipe.transformer_spatial_patch_size = 1
+        pipe.transformer_temporal_patch_size = 1
+
+        seen_encode_dtypes: list[torch.dtype] = []
+
+        def fake_encode(x):
+            seen_encode_dtypes.append(x.dtype)
+            return SimpleNamespace(
+                latent_dist=SimpleNamespace(mode=lambda: torch.zeros(1, 4, 1, 1, 1, dtype=x.dtype))
+            )
+
+        pipe.vae = SimpleNamespace(
+            dtype=torch.bfloat16,
+            encode=fake_encode,
+            latents_mean=torch.zeros(4),
+            latents_std=torch.ones(4),
+            config=SimpleNamespace(scaling_factor=1.0),
+        )
+        monkeypatch.setattr(ltx23, "retrieve_latents", lambda enc, generator, sample_mode: enc.latent_dist.mode())
+
+        image = torch.randn(1, 3, 32, 32, dtype=torch.float32)
+        latents, mask = pipe.prepare_image_to_video_latents(
+            image=image,
+            batch_size=1,
+            num_channels_latents=4,
+            height=32,
+            width=32,
+            num_frames=1,
+            dtype=torch.float32,
+            device=torch.device("cpu"),
+        )
+
+        assert seen_encode_dtypes == [torch.bfloat16], (
+            f"vae.encode must receive vae.dtype, got {seen_encode_dtypes}"
+        )
+        # Latents themselves come back in the requested latent dtype.
+        assert latents.dtype == torch.float32
+
 
 class TestLTX23DecodeConditioning:
     def test_decode_conditioning_expands_per_prompt_values_to_effective_batch(self):
@@ -911,6 +962,13 @@ class TestCFGParallelForwardPath:
                 torch.testing.assert_close(kwargs["audio_encoder_hidden_states"], expected_prompt)
                 assert kwargs["hidden_states"].shape == (1, 1, 2)
                 assert kwargs["audio_hidden_states"].shape == (1, 1, 2)
+                # Regression guard: audio_timestep must be a scalar (B,), not the
+                # per-token video timestep. The transformer would otherwise fall
+                # back to `timestep` which the I2V hook makes per-token.
+                assert "audio_timestep" in kwargs, "base forward must pass audio_timestep explicitly"
+                assert kwargs["audio_timestep"].ndim == 1, (
+                    f"audio_timestep must be scalar (B,), got shape {tuple(kwargs['audio_timestep'].shape)}"
+                )
                 if cfg_rank == 0:
                     return video_pos, audio_pos
                 return video_neg, audio_neg
@@ -1882,6 +1940,69 @@ class TestLTX23ConditionPipeline:
         )
         # video out = sample - v_corr = [[[6.0], [2.5]]]
         torch.testing.assert_close(out[0], torch.tensor([[[6.0], [2.5]]]))
+
+    def test_prepare_condition_latents_casts_condition_to_vae_dtype(self, monkeypatch):
+        """Each condition_tensor must be cast to vae.dtype before vae.encode.
+
+        Same regression as the I2V image path: passing the latent dtype
+        (float32) here trips the VAE conv layers at engine warmup.
+        """
+        from vllm_omni.diffusion.models.ltx2 import pipeline_ltx2_3 as ltx23
+
+        pipe = object.__new__(ltx23.LTX23ConditionPipeline)
+        torch.nn.Module.__init__(pipe)
+        pipe.vae_spatial_compression_ratio = 32
+        pipe.vae_temporal_compression_ratio = 1
+        pipe.transformer_spatial_patch_size = 1
+        pipe.transformer_temporal_patch_size = 1
+
+        seen_encode_dtypes: list[torch.dtype] = []
+
+        def fake_encode(x):
+            seen_encode_dtypes.append(x.dtype)
+            return SimpleNamespace(
+                latent_dist=SimpleNamespace(mode=lambda: torch.zeros(1, 4, 1, 1, 1, dtype=x.dtype))
+            )
+
+        pipe.vae = SimpleNamespace(
+            dtype=torch.bfloat16,
+            encode=fake_encode,
+            latents_mean=torch.zeros(4),
+            latents_std=torch.ones(4),
+            config=SimpleNamespace(scaling_factor=1.0),
+        )
+        pipe.video_processor = SimpleNamespace()
+
+        condition = ltx23.LTX2VideoCondition(
+            frames=SimpleNamespace(), index=0, strength=1.0
+        )
+
+        def fake_preprocess(conditions, video_processor, height, width, latent_num_frames, *, device, dtype):
+            # Emulate the real path: return a float32 condition tensor.
+            return ([torch.zeros(1, 3, 1, 1, 1, dtype=dtype)], [1.0], [0])
+
+        monkeypatch.setattr(ltx23, "_preprocess_conditions", fake_preprocess)
+        monkeypatch.setattr(ltx23, "retrieve_latents", lambda enc, generator, sample_mode: enc.latent_dist.mode())
+        monkeypatch.setattr(
+            ltx23.LTX23ConditionPipeline,
+            "apply_visual_conditioning",
+            lambda self, latents, mask, *_args, **_kw: (latents, mask, torch.zeros_like(latents)),
+        )
+
+        pipe.prepare_condition_latents(
+            conditions=[condition],
+            batch_size=1,
+            num_channels_latents=4,
+            height=32,
+            width=32,
+            num_frames=1,
+            dtype=torch.float32,
+            device=torch.device("cpu"),
+        )
+
+        assert seen_encode_dtypes == [torch.bfloat16], (
+            f"vae.encode must receive vae.dtype, got {seen_encode_dtypes}"
+        )
 
 
 class TestLTX23ConditionDistilledPipeline:

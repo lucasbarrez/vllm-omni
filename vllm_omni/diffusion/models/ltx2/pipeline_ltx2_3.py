@@ -2150,8 +2150,11 @@ class LTX23ConditionPipeline(LTX23Pipeline):
             )
             condition_latents: list[torch.Tensor] = []
             for condition_tensor in condition_frames:
+                # Cast to VAE dtype here; condition_latent is re-cast to `dtype` after encode.
                 condition_latent = retrieve_latents(
-                    self.vae.encode(condition_tensor), generator=generator, sample_mode="argmax"
+                    self.vae.encode(condition_tensor.to(dtype=self.vae.dtype)),
+                    generator=generator,
+                    sample_mode="argmax",
                 )
                 condition_latent = self._normalize_latents(
                     condition_latent, self.vae.latents_mean, self.vae.latents_std
