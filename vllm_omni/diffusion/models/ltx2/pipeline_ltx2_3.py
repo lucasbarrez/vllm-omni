@@ -1405,6 +1405,10 @@ class LTX23Pipeline(
                         "encoder_hidden_states": positive_connector_prompt_embeds,
                         "audio_encoder_hidden_states": positive_connector_audio_prompt_embeds,
                         "timestep": video_ts,
+                        # Pin audio modulation to the scalar timestep. The transformer
+                        # otherwise falls back to `timestep`, which is per-token when
+                        # `_build_video_timestep` is overridden (I2V, Condition).
+                        "audio_timestep": ts,
                         "sigma": ts,
                         "encoder_attention_mask": positive_connector_attention_mask,
                         "audio_encoder_attention_mask": positive_connector_attention_mask,
@@ -1464,6 +1468,7 @@ class LTX23Pipeline(
                             encoder_hidden_states=connector_prompt_embeds,
                             audio_encoder_hidden_states=connector_audio_prompt_embeds,
                             timestep=video_ts,
+                            audio_timestep=ts,  # see positive_kwargs above
                             sigma=ts,  # LTX-2.3: sigma for prompt_adaln
                             encoder_attention_mask=connector_attention_mask,
                             audio_encoder_attention_mask=connector_attention_mask,
