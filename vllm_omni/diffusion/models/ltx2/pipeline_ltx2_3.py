@@ -1301,16 +1301,16 @@ class LTX23Pipeline(
 
         num_channels_latents = self.transformer.config.in_channels
         latents = self.prepare_latents(
-            batch_size * num_videos_per_prompt,
-            num_channels_latents,
-            height,
-            width,
-            num_frames,
-            noise_scale,
-            torch.float32,
-            device,
-            generator,
-            latents,
+            batch_size=batch_size * num_videos_per_prompt,
+            num_channels_latents=num_channels_latents,
+            height=height,
+            width=width,
+            num_frames=num_frames,
+            noise_scale=noise_scale,
+            dtype=torch.float32,
+            device=device,
+            generator=generator,
+            latents=latents,
         )
 
         duration_s = num_frames / frame_rate
@@ -1617,9 +1617,9 @@ class LTX23ImageToVideoPipeline(LTX23Pipeline):
             raw_image = additional.get("image")
         return raw_image
 
-    def prepare_latents(
+    def prepare_image_to_video_latents(
         self,
-        image: torch.Tensor | None = None,
+        image: PIL.Image.Image | torch.Tensor | list | None = None,
         batch_size: int = 1,
         num_channels_latents: int = 128,
         height: int = 512,
@@ -1633,10 +1633,28 @@ class LTX23ImageToVideoPipeline(LTX23Pipeline):
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Prepare I2V latents and the first-frame conditioning mask.
 
+        Returns ``(packed_latents, packed_conditioning_mask)``. The mask is
+        1.0 on the first frame's packed tokens and 0.0 elsewhere.
+
         If caller-provided latents are used without an image, the latents must
         already represent the full video state including the conditioning first
         frame. Packed 3D latents are assumed to be in transformer token layout.
+
+        ``image`` may be a PIL image, a list of PIL images, or a tensor; PIL
+        inputs are preprocessed via ``self.video_processor`` using the supplied
+        pixel-space ``height`` / ``width``.
         """
+        # PIL → tensor preprocessing (pixel-space height/width).
+        if image is not None and latents is None:
+            if isinstance(image, torch.Tensor):
+                if image.ndim == 3:
+                    image = image.unsqueeze(0)
+            elif isinstance(image, list) and image and isinstance(image[0], torch.Tensor):
+                image = torch.stack(image, dim=0)
+            else:
+                image = self.video_processor.preprocess(image, height=height, width=width)
+            image = image.to(device=device, dtype=dtype)
+
         height = height // self.vae_spatial_compression_ratio
         width = width // self.vae_spatial_compression_ratio
         num_frames = (num_frames - 1) // self.vae_temporal_compression_ratio + 1
@@ -1738,107 +1756,80 @@ class LTX23ImageToVideoPipeline(LTX23Pipeline):
 
         return latents, conditioning_mask
 
-    def check_inputs(
+    def prepare_latents(
         self,
-        image,
-        height,
-        width,
-        prompt,
-        latents=None,
-        prompt_embeds=None,
-        negative_prompt_embeds=None,
-        prompt_attention_mask=None,
-        negative_prompt_attention_mask=None,
-    ):
-        if image is None and latents is None:
-            raise ValueError("Provide either `image` or `latents`. Cannot leave both undefined.")
-        super().check_inputs(
-            prompt=prompt,
+        batch_size: int = 1,
+        num_channels_latents: int = 128,
+        height: int = 512,
+        width: int = 768,
+        num_frames: int = 121,
+        noise_scale: float = 0.0,
+        dtype: torch.dtype | None = None,
+        device: torch.device | None = None,
+        generator: torch.Generator | list[torch.Generator] | None = None,
+        latents: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """:class:`LTX23Pipeline`-compatible adapter.
+
+        Pulls the image from ``self._pending_image`` (set by :meth:`forward`),
+        delegates to :meth:`prepare_image_to_video_latents`, and stashes the
+        conditioning mask on ``self._conditioning_mask`` for the hooks in the
+        denoising loop.
+        """
+        prepared, mask = self.prepare_image_to_video_latents(
+            image=getattr(self, "_pending_image", None),
+            batch_size=batch_size,
+            num_channels_latents=num_channels_latents,
             height=height,
             width=width,
-            prompt_embeds=prompt_embeds,
-            negative_prompt_embeds=negative_prompt_embeds,
-            prompt_attention_mask=prompt_attention_mask,
-            negative_prompt_attention_mask=negative_prompt_attention_mask,
+            num_frames=num_frames,
+            noise_scale=noise_scale,
+            dtype=dtype,
+            device=device,
+            generator=generator,
+            latents=latents,
         )
+        self._conditioning_mask = mask
+        return prepared
 
     _step_video_latents_i2v = LTX2ImageToVideoPipeline._step_video_latents_i2v
+
+    # ---- Hook overrides ----
+
+    def _build_video_timestep(self, ts: torch.Tensor) -> torch.Tensor:
+        """Mask the per-token video timestep so conditioned tokens stay at t=0."""
+        mask = self._conditioning_mask
+        if ts.shape[0] == 2 * mask.shape[0]:
+            mask = torch.cat([mask, mask])
+        return ts.unsqueeze(-1) * (1 - mask)
+
+    def _create_video_audio_scheduler(
+        self,
+        audio_scheduler: Any,
+        latent_num_frames: int,
+        latent_height: int,
+        latent_width: int,
+    ) -> Any:
+        return _I2VVideoAudioScheduler(
+            self, audio_scheduler, latent_num_frames, latent_height, latent_width,
+        )
 
     @torch.no_grad()
     def forward(
         self,
         req: OmniDiffusionRequest,
         image: PIL.Image.Image | torch.Tensor | list[PIL.Image.Image | torch.Tensor] | None = None,
-        prompt: str | list[str] | None = None,
-        negative_prompt: str | list[str] | None = None,
-        height: int | None = None,
-        width: int | None = None,
-        num_frames: int | None = None,
-        frame_rate: float | None = None,
-        num_inference_steps: int | None = None,
-        sigmas: list[float] | None = None,
-        timesteps: list[int] | None = None,
-        guidance_scale: float = 4.0,
-        noise_scale: float = 0.0,
-        num_videos_per_prompt: int | None = 1,
-        generator: torch.Generator | list[torch.Generator] | None = None,
-        latents: torch.Tensor | None = None,
-        audio_latents: torch.Tensor | None = None,
-        prompt_embeds: torch.Tensor | None = None,
-        negative_prompt_embeds: torch.Tensor | None = None,
-        prompt_attention_mask: torch.Tensor | None = None,
-        negative_prompt_attention_mask: torch.Tensor | None = None,
-        decode_timestep: float | list[float] = 0.0,
-        decode_noise_scale: float | list[float] | None = None,
-        output_type: str = "np",
-        return_dict: bool = True,
-        attention_kwargs: dict[str, Any] | None = None,
-        max_sequence_length: int | None = None,
+        **kwargs: Any,
     ) -> DiffusionOutput:
-        request_inputs = self._resolve_request_inputs(
-            req,
-            prompt=prompt,
-            negative_prompt=negative_prompt,
-            height=height,
-            width=width,
-            num_frames=num_frames,
-            frame_rate=frame_rate,
-            num_inference_steps=num_inference_steps,
-            timesteps=timesteps,
-            guidance_scale=guidance_scale,
-            num_videos_per_prompt=num_videos_per_prompt,
-            generator=generator,
-            latents=latents,
-            audio_latents=audio_latents,
-            prompt_embeds=prompt_embeds,
-            negative_prompt_embeds=negative_prompt_embeds,
-            prompt_attention_mask=prompt_attention_mask,
-            negative_prompt_attention_mask=negative_prompt_attention_mask,
-            decode_timestep=decode_timestep,
-            decode_noise_scale=decode_noise_scale,
-            output_type=output_type,
-            max_sequence_length=max_sequence_length,
-        )
-        prompt = request_inputs.prompt
-        negative_prompt = request_inputs.negative_prompt
-        height = request_inputs.height
-        width = request_inputs.width
-        num_frames = request_inputs.num_frames
-        frame_rate = request_inputs.frame_rate
-        num_inference_steps = request_inputs.num_inference_steps
-        guidance_scale = request_inputs.guidance_scale
-        num_videos_per_prompt = request_inputs.num_videos_per_prompt
-        generator = request_inputs.generator
-        latents = request_inputs.latents
-        audio_latents = request_inputs.audio_latents
-        prompt_embeds = request_inputs.prompt_embeds
-        negative_prompt_embeds = request_inputs.negative_prompt_embeds
-        prompt_attention_mask = request_inputs.prompt_attention_mask
-        negative_prompt_attention_mask = request_inputs.negative_prompt_attention_mask
-        decode_timestep = request_inputs.decode_timestep
-        decode_noise_scale = request_inputs.decode_noise_scale
-        output_type = request_inputs.output_type
-        max_sequence_length = request_inputs.max_sequence_length
+        """Resolve the conditioning image, stash it for ``prepare_latents``,
+        and delegate the denoising loop to :meth:`LTX23Pipeline.forward`.
+
+        Conditioning is applied through the hook overrides
+        :meth:`_build_video_timestep` and :meth:`_create_video_audio_scheduler`;
+        the heavy lifting (prompt encoding, scheduler, x0-space CFG, audio
+        branch) is unchanged from the base class.
+        """
+        latents_kwarg = kwargs.get("latents")
 
         if image is None and req.prompts:
             raw_images = []
@@ -1856,341 +1847,23 @@ class LTX23ImageToVideoPipeline(LTX23Pipeline):
                     raw_image = PIL.Image.open(raw_image).convert("RGB")
                 raw_images.append(raw_image)
 
-            if any(img is None for img in raw_images):
-                if latents is None:
-                    raise ValueError("Image is required for LTX-2.3 I2V generation.")
+            if any(img is None for img in raw_images) and latents_kwarg is None:
+                raise ValueError("Image is required for LTX-2.3 I2V generation.")
             if len(raw_images) == 1:
                 image = raw_images[0]
             elif raw_images:
                 image = raw_images
 
-        self.check_inputs(
-            image=image,
-            height=height,
-            width=width,
-            prompt=prompt,
-            latents=latents,
-            prompt_embeds=prompt_embeds,
-            negative_prompt_embeds=negative_prompt_embeds,
-            prompt_attention_mask=prompt_attention_mask,
-            negative_prompt_attention_mask=negative_prompt_attention_mask,
-        )
+        if image is None and latents_kwarg is None:
+            raise ValueError("Provide either `image` or `latents`. Cannot leave both undefined.")
 
-        self._guidance_scale = guidance_scale
-        self._attention_kwargs = attention_kwargs
-        self._interrupt = False
-        self._current_timestep = None
-        cfg_world_size = get_classifier_free_guidance_world_size()
-        if self.do_classifier_free_guidance and cfg_world_size not in (1, 2):
-            raise ValueError(
-                f"LTX23Pipeline supports CFG parallelism with cfg_parallel_size 1 or 2, but got {cfg_world_size}."
-            )
-        cfg_parallel_ready = self.do_classifier_free_guidance and cfg_world_size > 1
-
-        device = self.device
-        prompt_context = self._prepare_prompt_context(
-            prompt=prompt,
-            negative_prompt=negative_prompt,
-            prompt_embeds=prompt_embeds,
-            negative_prompt_embeds=negative_prompt_embeds,
-            prompt_attention_mask=prompt_attention_mask,
-            negative_prompt_attention_mask=negative_prompt_attention_mask,
-            num_videos_per_prompt=num_videos_per_prompt,
-            max_sequence_length=max_sequence_length,
-        )
-        batch_size = prompt_context.batch_size
-        connector_prompt_embeds = prompt_context.connector_prompt_embeds
-        connector_audio_prompt_embeds = prompt_context.connector_audio_prompt_embeds
-        connector_attention_mask = prompt_context.connector_attention_mask
-        positive_connector_prompt_embeds = prompt_context.positive_connector_prompt_embeds
-        positive_connector_audio_prompt_embeds = prompt_context.positive_connector_audio_prompt_embeds
-        positive_connector_attention_mask = prompt_context.positive_connector_attention_mask
-        negative_connector_prompt_embeds = prompt_context.negative_connector_prompt_embeds
-        negative_connector_audio_prompt_embeds = prompt_context.negative_connector_audio_prompt_embeds
-        negative_connector_attention_mask = prompt_context.negative_connector_attention_mask
-
-        latent_num_frames = (num_frames - 1) // self.vae_temporal_compression_ratio + 1
-        latent_height = height // self.vae_spatial_compression_ratio
-        latent_width = width // self.vae_spatial_compression_ratio
-        if latents is not None:
-            if latents.ndim == 5:
-                _, _, latent_num_frames, latent_height, latent_width = latents.shape
-            elif latents.ndim != 3:
-                raise ValueError(
-                    f"Provided `latents` tensor has shape {latents.shape}, but the expected shape is either "
-                    "[batch_size, seq_len, num_features] or "
-                    "[batch_size, latent_dim, latent_frames, latent_height, latent_width]."
-                )
-
-        if latents is None:
-            if isinstance(image, torch.Tensor):
-                if image.ndim == 3:
-                    image = image.unsqueeze(0)
-            elif isinstance(image, list) and image and isinstance(image[0], torch.Tensor):
-                image = torch.stack(image, dim=0)
-            else:
-                image = self.video_processor.preprocess(image, height=height, width=width)
-            image = image.to(device=device, dtype=positive_connector_prompt_embeds.dtype)
-
-        num_channels_latents = self.transformer.config.in_channels
-        latents, conditioning_mask = self.prepare_latents(
-            image,
-            batch_size * num_videos_per_prompt,
-            num_channels_latents,
-            height,
-            width,
-            num_frames,
-            noise_scale,
-            torch.float32,
-            device,
-            generator,
-            latents,
-        )
-
-        duration_s = num_frames / frame_rate
-        audio_latents_per_second = (
-            self.audio_sampling_rate / self.audio_hop_length / float(self.audio_vae_temporal_compression_ratio)
-        )
-        audio_num_frames = round(duration_s * audio_latents_per_second)
-        audio_num_frames = self._resolve_audio_latent_length(audio_num_frames, audio_latents)
-
-        num_mel_bins = self.audio_vae.config.mel_bins if self.audio_vae is not None else 64
-        latent_mel_bins = num_mel_bins // self.audio_vae_mel_compression_ratio
-        num_channels_latents_audio = self.audio_vae.config.latent_channels if self.audio_vae is not None else 8
-        audio_latents, original_audio_num_frames, padded_audio_num_frames = self.prepare_audio_latents(
-            batch_size * num_videos_per_prompt,
-            num_channels_latents=num_channels_latents_audio,
-            audio_latent_length=audio_num_frames,
-            num_mel_bins=num_mel_bins,
-            noise_scale=noise_scale,
-            dtype=torch.float32,
-            device=device,
-            generator=generator,
-            latents=audio_latents,
-        )
-
-        sigmas = np.linspace(1.0, 1 / num_inference_steps, num_inference_steps) if sigmas is None else sigmas
-        mu = calculate_shift(
-            self.scheduler.config.get("max_image_seq_len", 4096),
-            self.scheduler.config.get("base_image_seq_len", 1024),
-            self.scheduler.config.get("max_image_seq_len", 4096),
-            self.scheduler.config.get("base_shift", 0.95),
-            self.scheduler.config.get("max_shift", 2.05),
-        )
-        audio_scheduler = copy.deepcopy(self.scheduler)
-        video_audio_scheduler = _I2VVideoAudioScheduler(
-            self,
-            audio_scheduler,
-            latent_num_frames,
-            latent_height,
-            latent_width,
-        )
-        _ = retrieve_timesteps(audio_scheduler, num_inference_steps, device, timesteps, sigmas=sigmas, mu=mu)
-        timesteps, num_inference_steps = retrieve_timesteps(
-            self.scheduler,
-            num_inference_steps,
-            device,
-            timesteps,
-            sigmas=sigmas,
-            mu=mu,
-        )
-        self._num_timesteps = len(timesteps)
-
-        video_coords = self.transformer.rope.prepare_video_coords(
-            latents.shape[0],
-            latent_num_frames,
-            latent_height,
-            latent_width,
-            latents.device,
-            fps=frame_rate,
-        )
-        audio_coords = self.transformer.audio_rope.prepare_audio_coords(
-            audio_latents.shape[0],
-            padded_audio_num_frames,
-            audio_latents.device,
-        )
-
-        if self.do_classifier_free_guidance and not cfg_parallel_ready:
-            video_coords = video_coords.repeat((2,) + (1,) * (video_coords.ndim - 1))
-            audio_coords = audio_coords.repeat((2,) + (1,) * (audio_coords.ndim - 1))
-            conditioning_mask_for_model = torch.cat([conditioning_mask, conditioning_mask])
-        else:
-            conditioning_mask_for_model = conditioning_mask
-
-        with self.progress_bar(total=len(timesteps)) as pbar:
-            for i, t in enumerate(timesteps):
-                if self.interrupt:
-                    continue
-
-                self._current_timestep = t
-
-                if cfg_parallel_ready:
-                    latent_model_input = latents.to(positive_connector_prompt_embeds.dtype)
-                    audio_latent_model_input = audio_latents.to(positive_connector_prompt_embeds.dtype)
-                    ts = t.expand(latent_model_input.shape[0])
-                    video_ts = ts.unsqueeze(-1) * (1 - conditioning_mask)
-                    positive_kwargs = {
-                        "hidden_states": latent_model_input,
-                        "audio_hidden_states": audio_latent_model_input,
-                        "encoder_hidden_states": positive_connector_prompt_embeds,
-                        "audio_encoder_hidden_states": positive_connector_audio_prompt_embeds,
-                        "timestep": video_ts,
-                        "audio_timestep": ts,
-                        "sigma": ts,
-                        "encoder_attention_mask": positive_connector_attention_mask,
-                        "audio_encoder_attention_mask": positive_connector_attention_mask,
-                        "num_frames": latent_num_frames,
-                        "height": latent_height,
-                        "width": latent_width,
-                        "fps": frame_rate,
-                        "audio_num_frames": padded_audio_num_frames,
-                        "video_coords": video_coords,
-                        "audio_coords": audio_coords,
-                        "attention_kwargs": attention_kwargs,
-                        "return_dict": False,
-                    }
-                    negative_kwargs = {
-                        **positive_kwargs,
-                        "encoder_hidden_states": negative_connector_prompt_embeds,
-                        "audio_encoder_hidden_states": negative_connector_audio_prompt_embeds,
-                        "encoder_attention_mask": negative_connector_attention_mask,
-                        "audio_encoder_attention_mask": negative_connector_attention_mask,
-                    }
-                    noise_pred_video, noise_pred_audio = self.predict_noise_with_parallel_cfg(
-                        true_cfg_scale=guidance_scale,
-                        positive_kwargs=positive_kwargs,
-                        negative_kwargs=negative_kwargs,
-                        cfg_normalize=False,
-                        video_latents=latents,
-                        audio_latents=audio_latents,
-                        video_sigma=self.scheduler.sigmas[i],
-                        audio_sigma=audio_scheduler.sigmas[i],
-                    )
-                else:
-                    latent_model_input = torch.cat([latents] * 2) if self.do_classifier_free_guidance else latents
-                    latent_model_input = latent_model_input.to(connector_prompt_embeds.dtype)
-                    audio_latent_model_input = (
-                        torch.cat([audio_latents] * 2) if self.do_classifier_free_guidance else audio_latents
-                    )
-                    audio_latent_model_input = audio_latent_model_input.to(connector_prompt_embeds.dtype)
-                    ts = t.expand(latent_model_input.shape[0])
-                    video_ts = ts.unsqueeze(-1) * (1 - conditioning_mask_for_model)
-
-                    with self._transformer_cache_context("cond_uncond"):
-                        noise_pred_video, noise_pred_audio = self.transformer(
-                            hidden_states=latent_model_input,
-                            audio_hidden_states=audio_latent_model_input,
-                            encoder_hidden_states=connector_prompt_embeds,
-                            audio_encoder_hidden_states=connector_audio_prompt_embeds,
-                            timestep=video_ts,
-                            audio_timestep=ts,
-                            sigma=ts,
-                            encoder_attention_mask=connector_attention_mask,
-                            audio_encoder_attention_mask=connector_attention_mask,
-                            num_frames=latent_num_frames,
-                            height=latent_height,
-                            width=latent_width,
-                            fps=frame_rate,
-                            audio_num_frames=padded_audio_num_frames,
-                            video_coords=video_coords,
-                            audio_coords=audio_coords,
-                            attention_kwargs=attention_kwargs,
-                            return_dict=False,
-                        )
-
-                    noise_pred_video = noise_pred_video.float()
-                    noise_pred_audio = noise_pred_audio.float()
-                    if self.do_classifier_free_guidance:
-                        noise_pred_video_uncond, noise_pred_video_cond = noise_pred_video.chunk(2)
-                        noise_pred_video = self._combine_x0_space_cfg(
-                            latents,
-                            noise_pred_video_cond,
-                            noise_pred_video_uncond,
-                            self.scheduler.sigmas[i],
-                            guidance_scale,
-                        )
-
-                        noise_pred_audio_uncond, noise_pred_audio_cond = noise_pred_audio.chunk(2)
-                        noise_pred_audio = self._combine_x0_space_cfg(
-                            audio_latents,
-                            noise_pred_audio_cond,
-                            noise_pred_audio_uncond,
-                            audio_scheduler.sigmas[i],
-                            guidance_scale,
-                        )
-
-                latents, audio_latents = self.scheduler_step_maybe_with_cfg(
-                    (noise_pred_video, noise_pred_audio),
-                    (t, t),
-                    (latents, audio_latents),
-                    do_true_cfg=self.do_classifier_free_guidance,
-                    per_request_scheduler=video_audio_scheduler,
-                )
-                latents, audio_latents = self._synchronize_cfg_parallel_step_output(
-                    (latents, audio_latents),
-                    do_true_cfg=self.do_classifier_free_guidance,
-                )
-                pbar.update()
-
-        latents = self._unpack_latents(
-            latents,
-            latent_num_frames,
-            latent_height,
-            latent_width,
-            self.transformer_spatial_patch_size,
-            self.transformer_temporal_patch_size,
-        )
-        latents = self._denormalize_latents(
-            latents,
-            self.vae.latents_mean,
-            self.vae.latents_std,
-            self.vae.config.scaling_factor,
-        )
-
-        audio_latents = self._unpad_audio_latents(audio_latents, original_audio_num_frames)
-        audio_latents = self._denormalize_audio_latents(
-            audio_latents,
-            self.audio_vae.latents_mean,
-            self.audio_vae.latents_std,
-        )
-        audio_latents = self._unpack_audio_latents(
-            audio_latents,
-            original_audio_num_frames,
-            num_mel_bins=latent_mel_bins,
-        )
-
-        if output_type == "latent":
-            video = latents
-            audio = audio_latents
-        else:
-            latents = latents.to(connector_prompt_embeds.dtype)
-            if not self.vae.config.timestep_conditioning:
-                timestep_decode = None
-            else:
-                noise = randn_tensor(latents.shape, generator=generator, device=device, dtype=latents.dtype)
-                timestep_decode, decode_noise_scale_t = _prepare_decode_timestep_conditioning(
-                    decode_timestep=decode_timestep,
-                    decode_noise_scale=decode_noise_scale,
-                    prompt_batch_size=batch_size,
-                    effective_batch_size=latents.shape[0],
-                    device=device,
-                    dtype=latents.dtype,
-                )
-                latents = (1 - decode_noise_scale_t) * latents + decode_noise_scale_t * noise
-
-            latents = latents.to(self.vae.dtype)
-            video = self.vae.decode(latents, timestep_decode, return_dict=False)[0]
-            if video.numel() > 0:
-                video = self.video_processor.postprocess_video(video, output_type=output_type)
-
-            audio_latents = audio_latents.to(self.audio_vae.dtype)
-            generated_mel_spectrograms = self.audio_vae.decode(audio_latents, return_dict=False)[0]
-            audio = self.vocoder(generated_mel_spectrograms)
-
-        return DiffusionOutput(
-            output=(video, audio),
-            stage_durations=self.stage_durations if hasattr(self, "stage_durations") else None,
-        )
+        try:
+            self._pending_image = image
+            self._conditioning_mask = None
+            return super().forward(req, **kwargs)
+        finally:
+            self._pending_image = None
+            self._conditioning_mask = None
 
 
 class LTX23DistilledPipeline(LightricksDistilledMixin, LTX23Pipeline):
