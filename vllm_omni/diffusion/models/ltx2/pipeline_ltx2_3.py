@@ -1653,7 +1653,8 @@ class LTX23ImageToVideoPipeline(LTX23Pipeline):
                 image = torch.stack(image, dim=0)
             else:
                 image = self.video_processor.preprocess(image, height=height, width=width)
-            image = image.to(device=device, dtype=dtype)
+            # Cast to VAE dtype here; init_latents are re-cast to `dtype` after encode.
+            image = image.to(device=device, dtype=self.vae.dtype)
 
         height = height // self.vae_spatial_compression_ratio
         width = width // self.vae_spatial_compression_ratio
