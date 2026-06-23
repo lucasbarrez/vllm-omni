@@ -1648,7 +1648,12 @@ class TestLTX23ImageToVideoDistilledPipeline:
 
         pipe = object.__new__(LTX23ImageToVideoDistilledPipeline)
         req = SimpleNamespace(
-            sampling_params=SimpleNamespace(guidance_scale_provided=False),
+            sampling_params=SimpleNamespace(
+                num_inference_steps=None,
+                guidance_scale=1.0,
+                guidance_scale_provided=False,
+                do_classifier_free_guidance=False,
+            ),
             is_dummy_run=lambda: False,
         )
 
