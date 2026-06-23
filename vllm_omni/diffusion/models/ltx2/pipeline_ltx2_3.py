@@ -836,6 +836,36 @@ class LTX23Pipeline(
         x0_guided = x0_cond + (guidance_scale - 1) * (x0_cond - x0_uncond)
         return (sample - x0_guided) / sigma
 
+    # ------------------------------------------------------------------
+    # Extension hooks for frame-anchor conditioning subclasses
+    # ------------------------------------------------------------------
+
+    def _build_video_timestep(self, ts: torch.Tensor) -> torch.Tensor:
+        """Build the per-token video timestep passed to the transformer.
+
+        Default returns ``ts`` unchanged (scalar batch timestep, shape ``(B,)``).
+        Subclasses can override to inject per-token masking, e.g.
+        ``ts.unsqueeze(-1) * (1 - conditioning_mask)`` for frame anchoring.
+        The transformer accepts either ``(B,)`` or ``(B, N)`` shapes.
+        """
+        return ts
+
+    def _create_video_audio_scheduler(
+        self,
+        audio_scheduler: Any,
+        latent_num_frames: int,
+        latent_height: int,
+        latent_width: int,
+    ) -> Any:
+        """Build the composite (video, audio) scheduler wrapper used by the
+        denoising loop.
+
+        Default returns :class:`_VideoAudioScheduler` (vanilla joint step).
+        Subclasses can override to inject conditioning-aware video step logic
+        (e.g. x0-blend with clean condition latents).
+        """
+        return _VideoAudioScheduler(self.scheduler, audio_scheduler)
+
     def predict_noise(self, **kwargs):
         with self._transformer_cache_context("cond_uncond"):
             noise_pred_video, noise_pred_audio = self.transformer(**kwargs)
@@ -1317,7 +1347,6 @@ class LTX23Pipeline(
             self.scheduler.config.get("max_shift", 2.05),
         )
         audio_scheduler = copy.deepcopy(self.scheduler)
-        video_audio_scheduler = _VideoAudioScheduler(self.scheduler, audio_scheduler)
         _ = retrieve_timesteps(audio_scheduler, num_inference_steps, device, timesteps, sigmas=sigmas, mu=mu)
         timesteps, num_inference_steps = retrieve_timesteps(
             self.scheduler,
@@ -1328,6 +1357,10 @@ class LTX23Pipeline(
             mu=mu,
         )
         self._num_timesteps = len(timesteps)
+
+        video_audio_scheduler = self._create_video_audio_scheduler(
+            audio_scheduler, latent_num_frames, latent_height, latent_width,
+        )
 
         # ---- RoPE coordinates ----
         video_coords = self.transformer.rope.prepare_video_coords(
@@ -1365,12 +1398,13 @@ class LTX23Pipeline(
                     latent_model_input = latents.to(positive_connector_prompt_embeds.dtype)
                     audio_latent_model_input = audio_latents.to(positive_connector_prompt_embeds.dtype)
                     ts = t.expand(latent_model_input.shape[0])
+                    video_ts = self._build_video_timestep(ts)
                     positive_kwargs = {
                         "hidden_states": latent_model_input,
                         "audio_hidden_states": audio_latent_model_input,
                         "encoder_hidden_states": positive_connector_prompt_embeds,
                         "audio_encoder_hidden_states": positive_connector_audio_prompt_embeds,
-                        "timestep": ts,
+                        "timestep": video_ts,
                         "sigma": ts,
                         "encoder_attention_mask": positive_connector_attention_mask,
                         "audio_encoder_attention_mask": positive_connector_attention_mask,
@@ -1421,6 +1455,7 @@ class LTX23Pipeline(
                     )
                     audio_latent_model_input = audio_latent_model_input.to(connector_prompt_embeds.dtype)
                     ts = t.expand(latent_model_input.shape[0])
+                    video_ts = self._build_video_timestep(ts)
 
                     with self._transformer_cache_context("cond_uncond"):
                         noise_pred_video, noise_pred_audio = self.transformer(
@@ -1428,7 +1463,7 @@ class LTX23Pipeline(
                             audio_hidden_states=audio_latent_model_input,
                             encoder_hidden_states=connector_prompt_embeds,
                             audio_encoder_hidden_states=connector_audio_prompt_embeds,
-                            timestep=ts,
+                            timestep=video_ts,
                             sigma=ts,  # LTX-2.3: sigma for prompt_adaln
                             encoder_attention_mask=connector_attention_mask,
                             audio_encoder_attention_mask=connector_attention_mask,
@@ -1465,8 +1500,13 @@ class LTX23Pipeline(
                             guidance_scale,
                         )
 
-                    latents = self.scheduler.step(noise_pred_video, t, latents, return_dict=False)[0]
-                    audio_latents = audio_scheduler.step(noise_pred_audio, t, audio_latents, return_dict=False)[0]
+                    latents, audio_latents = self.scheduler_step_maybe_with_cfg(
+                        (noise_pred_video, noise_pred_audio),
+                        (t, t),
+                        (latents, audio_latents),
+                        do_true_cfg=self.do_classifier_free_guidance,
+                        per_request_scheduler=video_audio_scheduler,
+                    )
 
                 pbar.update()
 
