@@ -1958,6 +1958,67 @@ def _preprocess_conditions(
     return frames_tensors, strengths, indices
 
 
+class _ConditionVideoAudioScheduler:
+    """Composite scheduler for LTX-2.3 multi-anchor frame conditioning.
+
+    Wraps the video and audio schedulers. Before each video step, applies an
+    x0-space blend with the clean condition latents at the conditioned tokens:
+
+        x0_pred       = sample - velocity * sigma
+        x0_blended    = x0_pred * (1 - mask) + clean_latents * mask
+        velocity_corr = (sample - x0_blended) / sigma
+
+    then runs ``video_scheduler.step`` with the corrected velocity. Audio is
+    stepped unchanged.
+
+    Reads ``_conditioning_mask`` (shape ``(B, N)``) and ``_clean_latents``
+    (shape ``(B, N, C)``) from the parent pipeline; both are stashed by
+    :meth:`LTX23ConditionPipeline.prepare_latents` before the loop runs.
+    """
+
+    def __init__(self, pipeline: "LTX23ConditionPipeline", audio_scheduler: Any) -> None:
+        self._pipeline = pipeline
+        self.video_scheduler = pipeline.scheduler
+        self.audio_scheduler = audio_scheduler
+
+    def step(
+        self,
+        noise_pred: tuple[torch.Tensor, torch.Tensor],
+        t: tuple[torch.Tensor, torch.Tensor],
+        latents: tuple[torch.Tensor, torch.Tensor],
+        return_dict: bool = False,
+        generator: torch.Generator | None = None,
+    ) -> tuple[tuple[torch.Tensor, torch.Tensor]]:
+        noise_pred_video, noise_pred_audio = noise_pred
+        t_video, t_audio = t
+        latents_video, latents_audio = latents
+
+        # Ensure the scheduler's internal step_index is populated for the first call.
+        if self.video_scheduler.step_index is None:
+            self.video_scheduler._init_step_index(t_video)
+        sigma = self.video_scheduler.sigmas[self.video_scheduler.step_index]
+
+        mask = self._pipeline._conditioning_mask  # (B, N)
+        clean_latents = self._pipeline._clean_latents  # (B, N, C)
+        bsz = noise_pred_video.size(0)
+        if mask.shape[0] != bsz:
+            mask = mask[:bsz]
+        # Broadcast mask to channel dim for the velocity blend.
+        mask_3d = mask.unsqueeze(-1)
+
+        x0 = latents_video - noise_pred_video * sigma
+        x0_blended = x0 * (1 - mask_3d) + clean_latents * mask_3d
+        velocity_corr = ((latents_video - x0_blended) / sigma).to(noise_pred_video.dtype)
+
+        video_out = self.video_scheduler.step(
+            velocity_corr, t_video, latents_video, return_dict=False, generator=generator,
+        )[0]
+        audio_out = self.audio_scheduler.step(
+            noise_pred_audio, t_audio, latents_audio, return_dict=False, generator=generator,
+        )[0]
+        return ((video_out, audio_out),)
+
+
 class LTX23ConditionPipeline(LTX23Pipeline):
     """LTX-2.3 multi-anchor frame conditioning pipeline (FLF2V / FMLF).
 
@@ -2023,7 +2084,7 @@ class LTX23ConditionPipeline(LTX23Pipeline):
             clean_latents[:, start_token_idx:end_token_idx] = cond
         return latents, conditioning_mask, clean_latents
 
-    def prepare_latents(
+    def prepare_condition_latents(
         self,
         conditions: list[LTX2VideoCondition] | None = None,
         batch_size: int = 1,
@@ -2037,7 +2098,7 @@ class LTX23ConditionPipeline(LTX23Pipeline):
         generator: torch.Generator | None = None,
         latents: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Prepare condition-injected latents and the conditioning mask.
+        """Prepare condition-injected latents, mask, and clean latents.
 
         Returns ``(latents, conditioning_mask, clean_latents)``. Caller-
         provided ``latents`` are normalized and packed before the conditions
@@ -2114,6 +2175,87 @@ class LTX23ConditionPipeline(LTX23Pipeline):
 
         return latents, conditioning_mask, clean_latents
 
+    def prepare_latents(
+        self,
+        batch_size: int = 1,
+        num_channels_latents: int = 128,
+        height: int = 512,
+        width: int = 768,
+        num_frames: int = 121,
+        noise_scale: float = 1.0,
+        dtype: torch.dtype | None = None,
+        device: torch.device | None = None,
+        generator: torch.Generator | None = None,
+        latents: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """:class:`LTX23Pipeline`-compatible adapter.
+
+        With pending conditions (set by :meth:`forward`), delegates to
+        :meth:`prepare_condition_latents` and stashes
+        ``(_conditioning_mask, _clean_latents)`` on ``self`` for the hooks.
+        Without conditions, falls through to :meth:`LTX23Pipeline.prepare_latents`
+        so the T2V path is unaffected.
+        """
+        if not getattr(self, "_pending_conditions", None):
+            return super().prepare_latents(
+                batch_size=batch_size,
+                num_channels_latents=num_channels_latents,
+                height=height,
+                width=width,
+                num_frames=num_frames,
+                noise_scale=noise_scale,
+                dtype=dtype,
+                device=device,
+                generator=generator,
+                latents=latents,
+            )
+
+        prepared, mask, clean = self.prepare_condition_latents(
+            conditions=self._pending_conditions,
+            batch_size=batch_size,
+            num_channels_latents=num_channels_latents,
+            height=height,
+            width=width,
+            num_frames=num_frames,
+            noise_scale=noise_scale,
+            dtype=dtype,
+            device=device,
+            generator=generator,
+            latents=latents,
+        )
+        self._conditioning_mask = mask.squeeze(-1) if mask.ndim == 3 else mask
+        self._clean_latents = clean
+        return prepared
+
+    # ---- Hook overrides ----
+
+    def _build_video_timestep(self, ts: torch.Tensor) -> torch.Tensor:
+        """Mask the per-token video timestep so conditioned tokens stay at t=0.
+
+        Falls back to the base passthrough when no conditioning mask is active,
+        so the T2V path is unaffected.
+        """
+        mask = getattr(self, "_conditioning_mask", None)
+        if mask is None:
+            return ts
+        if ts.shape[0] == 2 * mask.shape[0]:
+            mask = torch.cat([mask, mask])
+        return ts.unsqueeze(-1) * (1 - mask)
+
+    def _create_video_audio_scheduler(
+        self,
+        audio_scheduler: Any,
+        latent_num_frames: int,
+        latent_height: int,
+        latent_width: int,
+    ) -> Any:
+        if getattr(self, "_conditioning_mask", None) is None:
+            return super()._create_video_audio_scheduler(
+                audio_scheduler, latent_num_frames, latent_height, latent_width,
+            )
+        return _ConditionVideoAudioScheduler(self, audio_scheduler)
+
+    @torch.no_grad()
     def forward(
         self,
         req: OmniDiffusionRequest,
@@ -2122,38 +2264,27 @@ class LTX23ConditionPipeline(LTX23Pipeline):
     ) -> DiffusionOutput:
         """LTX-2.3 multi-anchor conditional forward.
 
-        Two changes vs ``LTX23Pipeline.forward`` (the rest is identical):
+        When ``conditions`` is ``None`` or empty, falls back to the pure T2V
+        path of :class:`LTX23Pipeline`. Otherwise, stashes the conditions for
+        the :meth:`prepare_latents` adapter and runs the base denoising loop
+        with the condition-aware hooks active.
 
-        1. ``prepare_latents`` returns a triplet
-           ``(latents, conditioning_mask, clean_latents)`` instead of just
-           ``latents``.
-        2. In the denoising loop, the per-token video timestep is masked:
-           ``video_timestep = t * (1 - conditioning_mask.squeeze(-1))``.
-
-        With ``conditions=None`` (or empty), the pipeline falls back to the
-        pure T2V path of :class:`LTX23Pipeline`, which lets the variant be
-        registered safely before the conditioned denoising path is wired.
-
-        With non-empty ``conditions``, this method currently raises
-        :class:`NotImplementedError`. The full denoising-loop port (the
-        2-line surgical change above, applied to ~500 LOC of T2V forward
-        body) is gated on a GPU validation pass — see
-        ``docs/ltx-2.3/07-vllm-omni-condition-port-plan.md``.
+        The conditioning algorithm mirrors the Diffusers
+        ``LTX2ConditionPipeline``: at each step, the per-token video timestep
+        is masked by ``(1 - conditioning_mask)`` (transformer sees the
+        conditioned tokens as already-denoised), and the velocity prediction
+        is corrected in x0 space toward ``clean_latents`` weighted by the
+        per-token strength before ``scheduler.step``.
         """
-        if not conditions:
+        try:
+            self._pending_conditions = conditions or None
+            self._conditioning_mask = None
+            self._clean_latents = None
             return super().forward(req, **kwargs)
-
-        # TODO(condition): port the conditioned denoising loop. The surgical
-        # diff vs LTX23Pipeline.forward is documented in
-        # docs/ltx-2.3/07-vllm-omni-condition-port-plan.md §3.4. We
-        # intentionally do not ship a half-validated port; the helpers
-        # above (prepare_latents, apply_visual_conditioning,
-        # _preprocess_conditions) ARE testable in isolation and provide the
-        # full algorithmic substrate for the loop port.
-        raise NotImplementedError(
-            "LTX23ConditionPipeline.forward with non-empty conditions awaits "
-            "GPU validation. See docs/ltx-2.3/07-vllm-omni-condition-port-plan.md."
-        )
+        finally:
+            self._pending_conditions = None
+            self._conditioning_mask = None
+            self._clean_latents = None
 
 
 class LTX23ConditionDistilledPipeline(LightricksDistilledMixin, LTX23ConditionPipeline):
@@ -2161,9 +2292,7 @@ class LTX23ConditionDistilledPipeline(LightricksDistilledMixin, LTX23ConditionPi
 
     Composes the distilled defaults from :class:`LightricksDistilledMixin`
     with the multi-anchor FLF2V / FMLF logic from
-    :class:`LTX23ConditionPipeline`. Inherits the conditioned ``forward``
-    gating (raises ``NotImplementedError`` when conditions are supplied,
-    until the loop port is GPU-validated).
+    :class:`LTX23ConditionPipeline`.
     """
 
 
