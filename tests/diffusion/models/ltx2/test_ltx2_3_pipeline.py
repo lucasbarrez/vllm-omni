@@ -1335,6 +1335,18 @@ class TestLightricksDistilledMixin:
         defaults.update(overrides)
         return SimpleNamespace(**defaults)
 
+    @classmethod
+    def _make_request(cls, *, is_dummy_run: bool = False, **sampling_overrides):
+        """Build a request namespace shaped like the production OmniDiffusionRequest.
+
+        The mixin's forward branches on ``req.is_dummy_run()`` to skip sanitize
+        on the engine's warmup pass, so tests must provide that callable.
+        """
+        return SimpleNamespace(
+            sampling_params=cls._make_sampling_params(**sampling_overrides),
+            is_dummy_run=lambda: is_dummy_run,
+        )
+
     def test_mixin_injects_defaults_on_arbitrary_base(self):
         """Compose the mixin with a stub base; defaults must flow to super().forward."""
         from diffusers.pipelines.ltx2.utils import DISTILLED_SIGMA_VALUES
@@ -1353,7 +1365,7 @@ class TestLightricksDistilledMixin:
         class _Composed(LightricksDistilledMixin, _Base):
             pass
 
-        req = SimpleNamespace(sampling_params=self._make_sampling_params())
+        req = self._make_request()
         _Composed().forward(req)
 
         assert captured["sigmas"] is DISTILLED_SIGMA_VALUES
@@ -1377,7 +1389,7 @@ class TestLightricksDistilledMixin:
         class _Composed(LightricksDistilledMixin, _Base):
             pass
 
-        req = SimpleNamespace(sampling_params=self._make_sampling_params())
+        req = self._make_request()
         _Composed().forward(req, sigmas=[0.9, 0.4], num_inference_steps=12, guidance_scale=3.5)
 
         assert captured["sigmas"] == [0.9, 0.4]
@@ -1409,13 +1421,11 @@ class TestLightricksDistilledMixin:
         class _Composed(LightricksDistilledMixin, _Base):
             pass
 
-        req = SimpleNamespace(
-            sampling_params=self._make_sampling_params(
-                num_inference_steps=30,
-                guidance_scale=4.0,
-                guidance_scale_provided=True,
-                do_classifier_free_guidance=True,
-            )
+        req = self._make_request(
+            num_inference_steps=30,
+            guidance_scale=4.0,
+            guidance_scale_provided=True,
+            do_classifier_free_guidance=True,
         )
 
         with caplog.at_level("WARNING", logger="vllm_omni.diffusion.models.ltx2.distilled_mixin"):
@@ -1445,7 +1455,7 @@ class TestLightricksDistilledMixin:
         class _Composed(LightricksDistilledMixin, _Base):
             pass
 
-        req = SimpleNamespace(sampling_params=self._make_sampling_params(num_inference_steps=8))
+        req = self._make_request(num_inference_steps=8)
 
         with caplog.at_level("WARNING", logger="vllm_omni.diffusion.models.ltx2.distilled_mixin"):
             _Composed().forward(req)
@@ -1558,7 +1568,8 @@ class TestLTX23DistilledPipeline:
                 guidance_scale=1.0,
                 guidance_scale_provided=False,
                 do_classifier_free_guidance=False,
-            )
+            ),
+            is_dummy_run=lambda: False,
         )
 
         pipe.forward(req)
@@ -1636,7 +1647,10 @@ class TestLTX23ImageToVideoDistilledPipeline:
         monkeypatch.setattr(LTX23ImageToVideoPipeline, "forward", fake_super_forward)
 
         pipe = object.__new__(LTX23ImageToVideoDistilledPipeline)
-        req = SimpleNamespace(sampling_params=SimpleNamespace(guidance_scale_provided=False))
+        req = SimpleNamespace(
+            sampling_params=SimpleNamespace(guidance_scale_provided=False),
+            is_dummy_run=lambda: False,
+        )
 
         pipe.forward(req)
 
