@@ -19,14 +19,17 @@ import json
 import os
 from collections.abc import Iterable
 from contextlib import nullcontext
+from dataclasses import dataclass
 from typing import Any, ClassVar
 
 import numpy as np
+import PIL.Image
 import torch
 from diffusers import AutoencoderKLLTX2Audio, FlowMatchEulerDiscreteScheduler
 from diffusers.pipelines.ltx2 import LTX2TextConnectors
 from diffusers.pipelines.ltx2.vocoder import LTX2Vocoder
 from diffusers.pipelines.stable_diffusion.pipeline_stable_diffusion import retrieve_timesteps
+from diffusers.pipelines.stable_diffusion.pipeline_stable_diffusion_img2img import retrieve_latents
 from diffusers.utils.torch_utils import randn_tensor
 from diffusers.video_processor import VideoProcessor
 from huggingface_hub import hf_hub_download
@@ -60,6 +63,7 @@ from .pipeline_ltx2 import (
     create_transformer_from_config,
     load_transformer_config,
 )
+from .pipeline_ltx2_image2video import LTX2ImageToVideoPipeline, _I2VVideoAudioScheduler
 
 logger = init_logger(__name__)
 
@@ -68,6 +72,56 @@ try:
     from diffusers.pipelines.ltx2.vocoder import LTX2VocoderWithBWE
 except ImportError:
     LTX2VocoderWithBWE = None
+
+
+@dataclass
+class _LTX23RequestInputs:
+    prompt: str | list[str] | None
+    negative_prompt: str | list[str] | None
+    height: int
+    width: int
+    num_frames: int
+    frame_rate: float
+    num_inference_steps: int
+    guidance_scale: float
+    num_videos_per_prompt: int
+    generator: torch.Generator | list[torch.Generator] | None
+    latents: torch.Tensor | None
+    audio_latents: torch.Tensor | None
+    prompt_embeds: torch.Tensor | None
+    negative_prompt_embeds: torch.Tensor | None
+    prompt_attention_mask: torch.Tensor | None
+    negative_prompt_attention_mask: torch.Tensor | None
+    decode_timestep: float | list[float]
+    decode_noise_scale: float | list[float] | None
+    output_type: str
+    max_sequence_length: int
+
+
+@dataclass
+class _LTX23PromptContext:
+    batch_size: int
+    connector_prompt_embeds: torch.Tensor
+    connector_audio_prompt_embeds: torch.Tensor
+    connector_attention_mask: torch.Tensor
+    positive_connector_prompt_embeds: torch.Tensor
+    positive_connector_audio_prompt_embeds: torch.Tensor
+    positive_connector_attention_mask: torch.Tensor
+    negative_connector_prompt_embeds: torch.Tensor | None
+    negative_connector_audio_prompt_embeds: torch.Tensor | None
+    negative_connector_attention_mask: torch.Tensor | None
+
+
+def _stack_prompt_field_if_present(values: list[Any], field_name: str) -> torch.Tensor | None:
+    if not any(value is not None for value in values):
+        return None
+    missing_indices = [idx for idx, value in enumerate(values) if value is None]
+    if missing_indices:
+        raise ValueError(
+            f"`{field_name}` must be provided for every prompt when provided "
+            f"for any prompt. Missing prompt indices: {missing_indices}."
+        )
+    return torch.stack(values)
 
 
 def _detect_vocoder_output_sample_rate(model: str) -> int | None:
@@ -114,6 +168,58 @@ def get_ltx2_post_process_func(od_config: OmniDiffusionConfig):
         return output
 
     return post_process_func
+
+
+def _expand_per_prompt_decode_value(
+    value: float | list[float],
+    *,
+    prompt_batch_size: int,
+    effective_batch_size: int,
+    field_name: str,
+) -> list[float]:
+    if not isinstance(value, list):
+        return [value] * effective_batch_size
+    if len(value) == 1:
+        return value * effective_batch_size
+    if len(value) == effective_batch_size:
+        return value
+    if prompt_batch_size > 0 and len(value) == prompt_batch_size and effective_batch_size % prompt_batch_size == 0:
+        repeats = effective_batch_size // prompt_batch_size
+        return [item for item in value for _ in range(repeats)]
+    raise ValueError(
+        f"`{field_name}` must have length 1, prompt batch size ({prompt_batch_size}), or effective batch size"
+        f" ({effective_batch_size}); got {len(value)}."
+    )
+
+
+def _prepare_decode_timestep_conditioning(
+    *,
+    decode_timestep: float | list[float],
+    decode_noise_scale: float | list[float] | None,
+    prompt_batch_size: int,
+    effective_batch_size: int,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    decode_timestep_values = _expand_per_prompt_decode_value(
+        decode_timestep,
+        prompt_batch_size=prompt_batch_size,
+        effective_batch_size=effective_batch_size,
+        field_name="decode_timestep",
+    )
+    if decode_noise_scale is None:
+        decode_noise_scale_values = decode_timestep_values
+    else:
+        decode_noise_scale_values = _expand_per_prompt_decode_value(
+            decode_noise_scale,
+            prompt_batch_size=prompt_batch_size,
+            effective_batch_size=effective_batch_size,
+            field_name="decode_noise_scale",
+        )
+    return (
+        torch.tensor(decode_timestep_values, device=device, dtype=dtype),
+        torch.tensor(decode_noise_scale_values, device=device, dtype=dtype)[:, None, None, None, None],
+    )
 
 
 class LTX23Pipeline(
@@ -854,6 +960,212 @@ class LTX23Pipeline(
             torch.cuda.current_stream(device).synchronize()
         return latents
 
+    def _resolve_request_inputs(
+        self,
+        req: OmniDiffusionRequest,
+        *,
+        prompt: str | list[str] | None,
+        negative_prompt: str | list[str] | None,
+        height: int | None,
+        width: int | None,
+        num_frames: int | None,
+        frame_rate: float | None,
+        num_inference_steps: int | None,
+        timesteps: list[int] | None,
+        guidance_scale: float,
+        num_videos_per_prompt: int | None,
+        generator: torch.Generator | list[torch.Generator] | None,
+        latents: torch.Tensor | None,
+        audio_latents: torch.Tensor | None,
+        prompt_embeds: torch.Tensor | None,
+        negative_prompt_embeds: torch.Tensor | None,
+        prompt_attention_mask: torch.Tensor | None,
+        negative_prompt_attention_mask: torch.Tensor | None,
+        decode_timestep: float | list[float],
+        decode_noise_scale: float | list[float] | None,
+        output_type: str,
+        max_sequence_length: int | None,
+    ) -> _LTX23RequestInputs:
+        prompt = [p if isinstance(p, str) else (p.get("prompt") or "") for p in req.prompts] or prompt
+        if all(isinstance(p, str) or p.get("negative_prompt") is None for p in req.prompts):
+            negative_prompt = None
+        elif req.prompts:
+            negative_prompt = ["" if isinstance(p, str) else (p.get("negative_prompt") or "") for p in req.prompts]
+
+        height = req.sampling_params.height or height or 512
+        width = req.sampling_params.width or width or 768
+        num_frames = req.sampling_params.num_frames or num_frames or 121
+        frame_rate = req.sampling_params.resolved_frame_rate or frame_rate or 24.0
+        num_inference_steps = req.sampling_params.num_inference_steps or num_inference_steps or 40
+        if timesteps is None:
+            num_inference_steps = max(int(num_inference_steps), 2)
+        elif len(timesteps) < 2:
+            raise ValueError("`timesteps` must contain at least 2 values for FlowMatchEulerDiscreteScheduler.")
+
+        num_videos_per_prompt = (
+            req.sampling_params.num_outputs_per_prompt
+            if req.sampling_params.num_outputs_per_prompt > 0
+            else num_videos_per_prompt or 1
+        )
+        max_sequence_length = (
+            req.sampling_params.max_sequence_length or max_sequence_length or self.tokenizer_max_length
+        )
+
+        if req.sampling_params.guidance_scale_provided:
+            guidance_scale = req.sampling_params.guidance_scale
+
+        if generator is None:
+            generator = req.sampling_params.generator
+        if generator is None and req.sampling_params.seed is not None:
+            generator = torch.Generator(device=self.device).manual_seed(req.sampling_params.seed)
+
+        latents = req.sampling_params.latents if req.sampling_params.latents is not None else latents
+        audio_latents = (
+            req.sampling_params.audio_latents
+            if req.sampling_params.audio_latents is not None
+            else req.sampling_params.extra_args.get("audio_latents", audio_latents)
+        )
+
+        req_prompt_embeds = [_get_prompt_field(p, "prompt_embeds") for p in req.prompts]
+        stacked_prompt_embeds = _stack_prompt_field_if_present(req_prompt_embeds, "prompt_embeds")
+        if stacked_prompt_embeds is not None:
+            prompt_embeds = stacked_prompt_embeds
+            prompt = None
+
+        req_negative_prompt_embeds = [_get_prompt_field(p, "negative_prompt_embeds") for p in req.prompts]
+        stacked_negative_prompt_embeds = _stack_prompt_field_if_present(
+            req_negative_prompt_embeds, "negative_prompt_embeds"
+        )
+        if stacked_negative_prompt_embeds is not None:
+            negative_prompt_embeds = stacked_negative_prompt_embeds
+            negative_prompt = None
+
+        req_prompt_attention_masks = []
+        for prompt_item in req.prompts:
+            mask = _get_prompt_field(prompt_item, "prompt_attention_mask")
+            if mask is None:
+                mask = _get_prompt_field(prompt_item, "attention_mask")
+            req_prompt_attention_masks.append(mask)
+        stacked_prompt_attention_mask = _stack_prompt_field_if_present(
+            req_prompt_attention_masks, "prompt_attention_mask"
+        )
+        if stacked_prompt_attention_mask is not None:
+            prompt_attention_mask = stacked_prompt_attention_mask
+
+        req_negative_attention_masks = []
+        for prompt_item in req.prompts:
+            mask = _get_prompt_field(prompt_item, "negative_prompt_attention_mask")
+            if mask is None:
+                mask = _get_prompt_field(prompt_item, "negative_attention_mask")
+            req_negative_attention_masks.append(mask)
+        stacked_negative_prompt_attention_mask = _stack_prompt_field_if_present(
+            req_negative_attention_masks, "negative_prompt_attention_mask"
+        )
+        if stacked_negative_prompt_attention_mask is not None:
+            negative_prompt_attention_mask = stacked_negative_prompt_attention_mask
+
+        if req.sampling_params.decode_timestep is not None:
+            decode_timestep = req.sampling_params.decode_timestep
+        if req.sampling_params.decode_noise_scale is not None:
+            decode_noise_scale = req.sampling_params.decode_noise_scale
+        if req.sampling_params.output_type is not None:
+            output_type = req.sampling_params.output_type
+
+        return _LTX23RequestInputs(
+            prompt=prompt,
+            negative_prompt=negative_prompt,
+            height=int(height),
+            width=int(width),
+            num_frames=int(num_frames),
+            frame_rate=float(frame_rate),
+            num_inference_steps=int(num_inference_steps),
+            guidance_scale=guidance_scale,
+            num_videos_per_prompt=int(num_videos_per_prompt),
+            generator=generator,
+            latents=latents,
+            audio_latents=audio_latents,
+            prompt_embeds=prompt_embeds,
+            negative_prompt_embeds=negative_prompt_embeds,
+            prompt_attention_mask=prompt_attention_mask,
+            negative_prompt_attention_mask=negative_prompt_attention_mask,
+            decode_timestep=decode_timestep,
+            decode_noise_scale=decode_noise_scale,
+            output_type=output_type,
+            max_sequence_length=int(max_sequence_length),
+        )
+
+    def _prepare_prompt_context(
+        self,
+        *,
+        prompt: str | list[str] | None,
+        negative_prompt: str | list[str] | None,
+        prompt_embeds: torch.Tensor | None,
+        negative_prompt_embeds: torch.Tensor | None,
+        prompt_attention_mask: torch.Tensor | None,
+        negative_prompt_attention_mask: torch.Tensor | None,
+        num_videos_per_prompt: int,
+        max_sequence_length: int,
+    ) -> _LTX23PromptContext:
+        if prompt is not None and isinstance(prompt, str):
+            batch_size = 1
+        elif prompt is not None and isinstance(prompt, list):
+            batch_size = len(prompt)
+        else:
+            batch_size = prompt_embeds.shape[0]
+
+        prompt_embeds, prompt_attention_mask, negative_prompt_embeds, negative_prompt_attention_mask = (
+            self.encode_prompt(
+                prompt=prompt,
+                negative_prompt=negative_prompt,
+                do_classifier_free_guidance=self.do_classifier_free_guidance,
+                num_videos_per_prompt=num_videos_per_prompt,
+                prompt_embeds=prompt_embeds,
+                negative_prompt_embeds=negative_prompt_embeds,
+                prompt_attention_mask=prompt_attention_mask,
+                negative_prompt_attention_mask=negative_prompt_attention_mask,
+                max_sequence_length=max_sequence_length,
+                device=self.device,
+            )
+        )
+
+        if self.do_classifier_free_guidance:
+            prompt_embeds = torch.cat([negative_prompt_embeds, prompt_embeds], dim=0)
+            prompt_attention_mask = torch.cat([negative_prompt_attention_mask, prompt_attention_mask], dim=0)
+
+        connector_prompt_embeds, connector_audio_prompt_embeds, connector_attention_mask = self.connectors(
+            prompt_embeds,
+            prompt_attention_mask,
+            padding_side=getattr(self.tokenizer, "padding_side", "left"),
+        )
+
+        positive_connector_prompt_embeds = connector_prompt_embeds
+        positive_connector_audio_prompt_embeds = connector_audio_prompt_embeds
+        positive_connector_attention_mask = connector_attention_mask
+        negative_connector_prompt_embeds = None
+        negative_connector_audio_prompt_embeds = None
+        negative_connector_attention_mask = None
+        if self.do_classifier_free_guidance:
+            split_batch = batch_size * num_videos_per_prompt
+            negative_connector_prompt_embeds = connector_prompt_embeds[:split_batch]
+            positive_connector_prompt_embeds = connector_prompt_embeds[split_batch:]
+            negative_connector_audio_prompt_embeds = connector_audio_prompt_embeds[:split_batch]
+            positive_connector_audio_prompt_embeds = connector_audio_prompt_embeds[split_batch:]
+            negative_connector_attention_mask = connector_attention_mask[:split_batch]
+            positive_connector_attention_mask = connector_attention_mask[split_batch:]
+
+        return _LTX23PromptContext(
+            batch_size=batch_size,
+            connector_prompt_embeds=connector_prompt_embeds,
+            connector_audio_prompt_embeds=connector_audio_prompt_embeds,
+            connector_attention_mask=connector_attention_mask,
+            positive_connector_prompt_embeds=positive_connector_prompt_embeds,
+            positive_connector_audio_prompt_embeds=positive_connector_audio_prompt_embeds,
+            positive_connector_attention_mask=positive_connector_attention_mask,
+            negative_connector_prompt_embeds=negative_connector_prompt_embeds,
+            negative_connector_audio_prompt_embeds=negative_connector_audio_prompt_embeds,
+            negative_connector_attention_mask=negative_connector_attention_mask,
+        )
+
     # ------------------------------------------------------------------
     # Forward pass
     # ------------------------------------------------------------------
@@ -888,75 +1200,50 @@ class LTX23Pipeline(
         attention_kwargs: dict[str, Any] | None = None,
         max_sequence_length: int | None = None,
     ) -> DiffusionOutput:
-        # ---- Extract from request ----
-        prompt = [p if isinstance(p, str) else (p.get("prompt") or "") for p in req.prompts] or prompt
-        if all(isinstance(p, str) or p.get("negative_prompt") is None for p in req.prompts):
-            negative_prompt = None
-        elif req.prompts:
-            negative_prompt = ["" if isinstance(p, str) else (p.get("negative_prompt") or "") for p in req.prompts]
-
-        height = req.sampling_params.height or height or 512
-        width = req.sampling_params.width or width or 768
-        num_frames = req.sampling_params.num_frames or num_frames or 121
-        frame_rate = req.sampling_params.resolved_frame_rate or frame_rate or 24.0
-        num_inference_steps = req.sampling_params.num_inference_steps or num_inference_steps or 40
-        # Enforce minimum of 2 timesteps for flow matching scheduler
-        if timesteps is None:
-            num_inference_steps = max(int(num_inference_steps), 2)
-        elif len(timesteps) < 2:
-            raise ValueError("`timesteps` must contain at least 2 values for FlowMatchEulerDiscreteScheduler.")
-        num_videos_per_prompt = (
-            req.sampling_params.num_outputs_per_prompt
-            if req.sampling_params.num_outputs_per_prompt > 0
-            else num_videos_per_prompt or 1
+        request_inputs = self._resolve_request_inputs(
+            req,
+            prompt=prompt,
+            negative_prompt=negative_prompt,
+            height=height,
+            width=width,
+            num_frames=num_frames,
+            frame_rate=frame_rate,
+            num_inference_steps=num_inference_steps,
+            timesteps=timesteps,
+            guidance_scale=guidance_scale,
+            num_videos_per_prompt=num_videos_per_prompt,
+            generator=generator,
+            latents=latents,
+            audio_latents=audio_latents,
+            prompt_embeds=prompt_embeds,
+            negative_prompt_embeds=negative_prompt_embeds,
+            prompt_attention_mask=prompt_attention_mask,
+            negative_prompt_attention_mask=negative_prompt_attention_mask,
+            decode_timestep=decode_timestep,
+            decode_noise_scale=decode_noise_scale,
+            output_type=output_type,
+            max_sequence_length=max_sequence_length,
         )
-        max_sequence_length = (
-            req.sampling_params.max_sequence_length or max_sequence_length or self.tokenizer_max_length
-        )
-
-        if req.sampling_params.guidance_scale_provided:
-            guidance_scale = req.sampling_params.guidance_scale
-
-        if generator is None:
-            generator = req.sampling_params.generator
-        if generator is None and req.sampling_params.seed is not None:
-            generator = torch.Generator(device=self.device).manual_seed(req.sampling_params.seed)
-
-        latents = req.sampling_params.latents if req.sampling_params.latents is not None else latents
-        audio_latents = (
-            req.sampling_params.audio_latents
-            if req.sampling_params.audio_latents is not None
-            else req.sampling_params.extra_args.get("audio_latents", audio_latents)
-        )
-
-        # Override with pre-computed embeddings if provided in request
-        req_prompt_embeds = [_get_prompt_field(p, "prompt_embeds") for p in req.prompts]
-        if any(p is not None for p in req_prompt_embeds):
-            prompt_embeds = torch.stack(req_prompt_embeds)
-
-        req_negative_prompt_embeds = [_get_prompt_field(p, "negative_prompt_embeds") for p in req.prompts]
-        if any(p is not None for p in req_negative_prompt_embeds):
-            negative_prompt_embeds = torch.stack(req_negative_prompt_embeds)
-
-        req_prompt_attention_masks = [
-            _get_prompt_field(p, "prompt_attention_mask") or _get_prompt_field(p, "attention_mask") for p in req.prompts
-        ]
-        if any(m is not None for m in req_prompt_attention_masks):
-            prompt_attention_mask = torch.stack(req_prompt_attention_masks)
-
-        req_negative_attention_masks = [
-            _get_prompt_field(p, "negative_prompt_attention_mask") or _get_prompt_field(p, "negative_attention_mask")
-            for p in req.prompts
-        ]
-        if any(m is not None for m in req_negative_attention_masks):
-            negative_prompt_attention_mask = torch.stack(req_negative_attention_masks)
-
-        if req.sampling_params.decode_timestep is not None:
-            decode_timestep = req.sampling_params.decode_timestep
-        if req.sampling_params.decode_noise_scale is not None:
-            decode_noise_scale = req.sampling_params.decode_noise_scale
-        if req.sampling_params.output_type is not None:
-            output_type = req.sampling_params.output_type
+        prompt = request_inputs.prompt
+        negative_prompt = request_inputs.negative_prompt
+        height = request_inputs.height
+        width = request_inputs.width
+        num_frames = request_inputs.num_frames
+        frame_rate = request_inputs.frame_rate
+        num_inference_steps = request_inputs.num_inference_steps
+        guidance_scale = request_inputs.guidance_scale
+        num_videos_per_prompt = request_inputs.num_videos_per_prompt
+        generator = request_inputs.generator
+        latents = request_inputs.latents
+        audio_latents = request_inputs.audio_latents
+        prompt_embeds = request_inputs.prompt_embeds
+        negative_prompt_embeds = request_inputs.negative_prompt_embeds
+        prompt_attention_mask = request_inputs.prompt_attention_mask
+        negative_prompt_attention_mask = request_inputs.negative_prompt_attention_mask
+        decode_timestep = request_inputs.decode_timestep
+        decode_noise_scale = request_inputs.decode_noise_scale
+        output_type = request_inputs.output_type
+        max_sequence_length = request_inputs.max_sequence_length
 
         self.check_inputs(
             prompt=prompt,
@@ -979,61 +1266,27 @@ class LTX23Pipeline(
             )
         cfg_parallel_ready = self.do_classifier_free_guidance and cfg_world_size > 1
 
-        if prompt is not None and isinstance(prompt, str):
-            batch_size = 1
-        elif prompt is not None and isinstance(prompt, list):
-            batch_size = len(prompt)
-        else:
-            batch_size = prompt_embeds.shape[0]
-
         device = self.device
-
-        # ---- Encode prompts ----
-        (
-            prompt_embeds,
-            prompt_attention_mask,
-            negative_prompt_embeds,
-            negative_prompt_attention_mask,
-        ) = self.encode_prompt(
+        prompt_context = self._prepare_prompt_context(
             prompt=prompt,
             negative_prompt=negative_prompt,
-            do_classifier_free_guidance=self.do_classifier_free_guidance,
-            num_videos_per_prompt=num_videos_per_prompt,
             prompt_embeds=prompt_embeds,
             negative_prompt_embeds=negative_prompt_embeds,
             prompt_attention_mask=prompt_attention_mask,
             negative_prompt_attention_mask=negative_prompt_attention_mask,
+            num_videos_per_prompt=num_videos_per_prompt,
             max_sequence_length=max_sequence_length,
-            device=device,
         )
-
-        # ---- Connectors (LTX-2.3: padding_side API) ----
-        # Concatenate negative + positive embeddings BEFORE connector call,
-        # matching diffusers which calls connectors once with batch=2.
-        # This ensures batch-dependent operations produce identical results.
-        if self.do_classifier_free_guidance:
-            prompt_embeds = torch.cat([negative_prompt_embeds, prompt_embeds], dim=0)
-            prompt_attention_mask = torch.cat([negative_prompt_attention_mask, prompt_attention_mask], dim=0)
-
-        tokenizer_padding_side = getattr(self.tokenizer, "padding_side", "left")
-        connector_prompt_embeds, connector_audio_prompt_embeds, connector_attention_mask = self.connectors(
-            prompt_embeds, prompt_attention_mask, padding_side=tokenizer_padding_side
-        )
-
-        positive_connector_prompt_embeds = connector_prompt_embeds
-        positive_connector_audio_prompt_embeds = connector_audio_prompt_embeds
-        positive_connector_attention_mask = connector_attention_mask
-        negative_connector_prompt_embeds = None
-        negative_connector_audio_prompt_embeds = None
-        negative_connector_attention_mask = None
-        if self.do_classifier_free_guidance:
-            split_batch = batch_size * num_videos_per_prompt
-            negative_connector_prompt_embeds = connector_prompt_embeds[:split_batch]
-            positive_connector_prompt_embeds = connector_prompt_embeds[split_batch:]
-            negative_connector_audio_prompt_embeds = connector_audio_prompt_embeds[:split_batch]
-            positive_connector_audio_prompt_embeds = connector_audio_prompt_embeds[split_batch:]
-            negative_connector_attention_mask = connector_attention_mask[:split_batch]
-            positive_connector_attention_mask = connector_attention_mask[split_batch:]
+        batch_size = prompt_context.batch_size
+        connector_prompt_embeds = prompt_context.connector_prompt_embeds
+        connector_audio_prompt_embeds = prompt_context.connector_audio_prompt_embeds
+        connector_attention_mask = prompt_context.connector_attention_mask
+        positive_connector_prompt_embeds = prompt_context.positive_connector_prompt_embeds
+        positive_connector_audio_prompt_embeds = prompt_context.positive_connector_audio_prompt_embeds
+        positive_connector_attention_mask = prompt_context.positive_connector_attention_mask
+        negative_connector_prompt_embeds = prompt_context.negative_connector_prompt_embeds
+        negative_connector_audio_prompt_embeds = prompt_context.negative_connector_audio_prompt_embeds
+        negative_connector_attention_mask = prompt_context.negative_connector_attention_mask
 
         # ---- Prepare latents ----
         latent_num_frames = (num_frames - 1) // self.vae_temporal_compression_ratio + 1
@@ -1044,16 +1297,16 @@ class LTX23Pipeline(
 
         num_channels_latents = self.transformer.config.in_channels
         latents = self.prepare_latents(
-            batch_size * num_videos_per_prompt,
-            num_channels_latents,
-            height,
-            width,
-            num_frames,
-            noise_scale,
-            torch.float32,
-            device,
-            generator,
-            latents,
+            batch_size=batch_size * num_videos_per_prompt,
+            num_channels_latents=num_channels_latents,
+            height=height,
+            width=width,
+            num_frames=num_frames,
+            noise_scale=noise_scale,
+            dtype=torch.float32,
+            device=device,
+            generator=generator,
+            latents=latents,
         )
 
         duration_s = num_frames / frame_rate
@@ -1297,16 +1550,14 @@ class LTX23Pipeline(
                 timestep_decode = None
             else:
                 noise = randn_tensor(latents.shape, generator=generator, device=device, dtype=latents.dtype)
-                if not isinstance(decode_timestep, list):
-                    decode_timestep = [decode_timestep] * batch_size
-                if decode_noise_scale is None:
-                    decode_noise_scale = decode_timestep
-                elif not isinstance(decode_noise_scale, list):
-                    decode_noise_scale = [decode_noise_scale] * batch_size
-                timestep_decode = torch.tensor(decode_timestep, device=device, dtype=latents.dtype)
-                decode_noise_scale_t = torch.tensor(decode_noise_scale, device=device, dtype=latents.dtype)[
-                    :, None, None, None, None
-                ]
+                timestep_decode, decode_noise_scale_t = _prepare_decode_timestep_conditioning(
+                    decode_timestep=decode_timestep,
+                    decode_noise_scale=decode_noise_scale,
+                    prompt_batch_size=batch_size,
+                    effective_batch_size=latents.shape[0],
+                    device=device,
+                    dtype=latents.dtype,
+                )
                 latents = (1 - decode_noise_scale_t) * latents + decode_noise_scale_t * noise
 
             latents = latents.to(self.vae.dtype)
@@ -1329,15 +1580,292 @@ class LTX23Pipeline(
         return loader.load_weights(weights)
 
 
-class LTX23ImageToVideoPipeline(nn.Module):
-    """LTX-2.3 image-to-video pipeline placeholder."""
+class LTX23ImageToVideoPipeline(LTX23Pipeline):
+    """LTX-2.3 image-to-video pipeline.
+
+    This keeps the LTX-2.3 prompt connector, x0-space CFG, sigma prompt
+    modulation, and audio branch semantics from ``LTX23Pipeline`` while
+    reusing the existing LTX image-conditioning contract: the first video
+    latent frame is encoded from the input image and remains fixed during
+    denoising.
+    """
 
     def __init__(self, *, od_config: OmniDiffusionConfig, prefix: str = ""):
-        super().__init__()
-        raise NotImplementedError(
-            "LTX23ImageToVideoPipeline is not yet implemented. "
-            "Use LTX23Pipeline for single-stage text-to-video generation."
+        super().__init__(od_config=od_config, prefix=prefix)
+        self.video_processor = VideoProcessor(vae_scale_factor=self.vae_spatial_compression_ratio, resample="bilinear")
+
+    support_image_input = True
+
+    _normalize_latents = staticmethod(LTX2ImageToVideoPipeline._normalize_latents)
+
+    @staticmethod
+    def _resolve_single_prompt_image(raw_image: Any) -> Any:
+        if isinstance(raw_image, list):
+            if len(raw_image) != 1:
+                raise ValueError(
+                    "LTX-2.3 I2V prompt dictionaries support exactly one image per prompt. "
+                    "Pass one image per prompt for batched I2V requests."
+                )
+            return raw_image[0]
+        return raw_image
+
+    @staticmethod
+    def _resolve_additional_image(additional: dict[str, Any]) -> Any:
+        raw_image = additional.get("preprocessed_image")
+        if raw_image is None:
+            raw_image = additional.get("pixel_values")
+        if raw_image is None:
+            raw_image = additional.get("image")
+        return raw_image
+
+    def prepare_image_to_video_latents(
+        self,
+        image: PIL.Image.Image | torch.Tensor | list | None = None,
+        batch_size: int = 1,
+        num_channels_latents: int = 128,
+        height: int = 512,
+        width: int = 768,
+        num_frames: int = 121,
+        noise_scale: float = 0.0,
+        dtype: torch.dtype | None = None,
+        device: torch.device | None = None,
+        generator: torch.Generator | list[torch.Generator] | None = None,
+        latents: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Prepare I2V latents and the first-frame conditioning mask.
+
+        Returns ``(packed_latents, packed_conditioning_mask)``. The mask is
+        1.0 on the first frame's packed tokens and 0.0 elsewhere.
+
+        If caller-provided latents are used without an image, the latents must
+        already represent the full video state including the conditioning first
+        frame. Packed 3D latents are assumed to be in transformer token layout.
+
+        ``image`` may be a PIL image, a list of PIL images, or a tensor; PIL
+        inputs are preprocessed via ``self.video_processor`` using the supplied
+        pixel-space ``height`` / ``width``.
+        """
+        # PIL → tensor preprocessing (pixel-space height/width).
+        if image is not None and latents is None:
+            if isinstance(image, torch.Tensor):
+                if image.ndim == 3:
+                    image = image.unsqueeze(0)
+            elif isinstance(image, list) and image and isinstance(image[0], torch.Tensor):
+                image = torch.stack(image, dim=0)
+            else:
+                image = self.video_processor.preprocess(image, height=height, width=width)
+            # Cast to VAE dtype here; init_latents are re-cast to `dtype` after encode.
+            image = image.to(device=device, dtype=self.vae.dtype)
+
+        height = height // self.vae_spatial_compression_ratio
+        width = width // self.vae_spatial_compression_ratio
+        num_frames = (num_frames - 1) // self.vae_temporal_compression_ratio + 1
+
+        shape = (batch_size, num_channels_latents, num_frames, height, width)
+        mask_shape = (batch_size, 1, num_frames, height, width)
+
+        if latents is not None:
+            if latents.ndim == 5:
+                batch_size, _, num_frames, height, width = latents.shape
+                mask_shape = (batch_size, 1, num_frames, height, width)
+                conditioning_mask = latents.new_zeros(mask_shape)
+                conditioning_mask[:, :, 0] = 1.0
+
+                latents = self._normalize_latents(
+                    latents,
+                    self.vae.latents_mean,
+                    self.vae.latents_std,
+                    self.vae.config.scaling_factor,
+                )
+                latents = self._create_noised_state(latents, noise_scale * (1 - conditioning_mask), generator)
+                latents = self._pack_latents(
+                    latents,
+                    self.transformer_spatial_patch_size,
+                    self.transformer_temporal_patch_size,
+                )
+            else:
+                conditioning_mask = latents.new_zeros(mask_shape)
+                conditioning_mask[:, :, 0] = 1.0
+
+            conditioning_mask = self._pack_latents(
+                conditioning_mask,
+                self.transformer_spatial_patch_size,
+                self.transformer_temporal_patch_size,
+            ).squeeze(-1)
+            if latents.ndim != 3 or latents.shape[:2] != conditioning_mask.shape:
+                raise ValueError(
+                    "Provided `latents` tensor has shape"
+                    f" {latents.shape}, but the expected shape is {conditioning_mask.shape + (num_channels_latents,)}."
+                )
+            if noise_scale != 0:
+                noise = randn_tensor(latents.shape, generator=generator, device=latents.device, dtype=latents.dtype)
+                noise_scale_t = noise_scale * (1 - conditioning_mask).unsqueeze(-1)
+                latents = (1 - noise_scale_t) * latents + noise_scale_t * noise
+            return latents.to(device=device, dtype=dtype), conditioning_mask
+
+        if image is None:
+            raise ValueError("`image` must be provided when `latents` is None.")
+
+        image_batch_size = image.shape[0]
+        if image_batch_size == 0:
+            raise ValueError("`image` batch is empty.")
+        if batch_size % image_batch_size != 0:
+            raise ValueError(
+                f"`batch_size` ({batch_size}) must be divisible by image batch size ({image_batch_size}) "
+                "for image-to-video outputs."
+            )
+        num_videos_per_prompt = batch_size // image_batch_size
+
+        if isinstance(generator, list):
+            if len(generator) != batch_size:
+                raise ValueError(
+                    f"You have passed a list of generators of length {len(generator)}, but requested an effective"
+                    f" batch size of {batch_size}. Make sure the batch size matches the length of the generators."
+                )
+            image_generators = [generator[i * num_videos_per_prompt] for i in range(image_batch_size)]
+            init_latents = [
+                retrieve_latents(self.vae.encode(image[i].unsqueeze(0).unsqueeze(2)), image_generators[i], "argmax")
+                for i in range(image_batch_size)
+            ]
+        else:
+            init_latents = [
+                retrieve_latents(self.vae.encode(img.unsqueeze(0).unsqueeze(2)), generator, "argmax") for img in image
+            ]
+
+        init_latents = torch.cat(init_latents, dim=0).to(dtype)
+        if num_videos_per_prompt > 1:
+            init_latents = init_latents.repeat_interleave(num_videos_per_prompt, dim=0)
+        init_latents = self._normalize_latents(
+            init_latents,
+            self.vae.latents_mean,
+            self.vae.latents_std,
+            self.vae.config.scaling_factor,
         )
+        init_latents = init_latents.repeat(1, 1, num_frames, 1, 1)
+
+        conditioning_mask = torch.zeros(mask_shape, device=device, dtype=dtype)
+        conditioning_mask[:, :, 0] = 1.0
+
+        noise = randn_tensor(shape, generator=generator, device=device, dtype=dtype)
+        latents = init_latents * conditioning_mask + noise * (1 - conditioning_mask)
+
+        conditioning_mask = self._pack_latents(
+            conditioning_mask,
+            self.transformer_spatial_patch_size,
+            self.transformer_temporal_patch_size,
+        ).squeeze(-1)
+        latents = self._pack_latents(latents, self.transformer_spatial_patch_size, self.transformer_temporal_patch_size)
+
+        return latents, conditioning_mask
+
+    def prepare_latents(
+        self,
+        batch_size: int = 1,
+        num_channels_latents: int = 128,
+        height: int = 512,
+        width: int = 768,
+        num_frames: int = 121,
+        noise_scale: float = 0.0,
+        dtype: torch.dtype | None = None,
+        device: torch.device | None = None,
+        generator: torch.Generator | list[torch.Generator] | None = None,
+        latents: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """:class:`LTX23Pipeline`-compatible adapter.
+
+        Pulls the image from ``self._pending_image`` (set by :meth:`forward`),
+        delegates to :meth:`prepare_image_to_video_latents`, and stashes the
+        conditioning mask on ``self._conditioning_mask`` for the hooks in the
+        denoising loop.
+        """
+        prepared, mask = self.prepare_image_to_video_latents(
+            image=getattr(self, "_pending_image", None),
+            batch_size=batch_size,
+            num_channels_latents=num_channels_latents,
+            height=height,
+            width=width,
+            num_frames=num_frames,
+            noise_scale=noise_scale,
+            dtype=dtype,
+            device=device,
+            generator=generator,
+            latents=latents,
+        )
+        self._conditioning_mask = mask
+        return prepared
+
+    _step_video_latents_i2v = LTX2ImageToVideoPipeline._step_video_latents_i2v
+
+    # ---- Hook overrides ----
+
+    def _build_video_timestep(self, ts: torch.Tensor) -> torch.Tensor:
+        """Mask the per-token video timestep so conditioned tokens stay at t=0."""
+        mask = self._conditioning_mask
+        if ts.shape[0] == 2 * mask.shape[0]:
+            mask = torch.cat([mask, mask])
+        return ts.unsqueeze(-1) * (1 - mask)
+
+    def _create_video_audio_scheduler(
+        self,
+        audio_scheduler: Any,
+        latent_num_frames: int,
+        latent_height: int,
+        latent_width: int,
+    ) -> Any:
+        return _I2VVideoAudioScheduler(
+            self, audio_scheduler, latent_num_frames, latent_height, latent_width,
+        )
+
+    @torch.no_grad()
+    def forward(
+        self,
+        req: OmniDiffusionRequest,
+        image: PIL.Image.Image | torch.Tensor | list[PIL.Image.Image | torch.Tensor] | None = None,
+        **kwargs: Any,
+    ) -> DiffusionOutput:
+        """Resolve the conditioning image, stash it for ``prepare_latents``,
+        and delegate the denoising loop to :meth:`LTX23Pipeline.forward`.
+
+        Conditioning is applied through the hook overrides
+        :meth:`_build_video_timestep` and :meth:`_create_video_audio_scheduler`;
+        the heavy lifting (prompt encoding, scheduler, x0-space CFG, audio
+        branch) is unchanged from the base class.
+        """
+        latents_kwarg = kwargs.get("latents")
+
+        if image is None and req.prompts:
+            raw_images = []
+            for prompt_item in req.prompts:
+                if isinstance(prompt_item, str):
+                    raw_image = None
+                else:
+                    multi_modal_data = prompt_item.get("multi_modal_data") or {}
+                    raw_image = multi_modal_data.get("image")
+                    if raw_image is None:
+                        additional = prompt_item.get("additional_information") or {}
+                        raw_image = self._resolve_additional_image(additional)
+                raw_image = self._resolve_single_prompt_image(raw_image)
+                if isinstance(raw_image, str):
+                    raw_image = PIL.Image.open(raw_image).convert("RGB")
+                raw_images.append(raw_image)
+
+            if any(img is None for img in raw_images) and latents_kwarg is None:
+                raise ValueError("Image is required for LTX-2.3 I2V generation.")
+            if len(raw_images) == 1:
+                image = raw_images[0]
+            elif raw_images:
+                image = raw_images
+
+        if image is None and latents_kwarg is None:
+            raise ValueError("Provide either `image` or `latents`. Cannot leave both undefined.")
+
+        try:
+            self._pending_image = image
+            self._conditioning_mask = None
+            return super().forward(req, **kwargs)
+        finally:
+            self._pending_image = None
+            self._conditioning_mask = None
 
 
 class LTX23DistilledPipeline(LightricksDistilledMixin, LTX23Pipeline):
@@ -1347,4 +1875,15 @@ class LTX23DistilledPipeline(LightricksDistilledMixin, LTX23Pipeline):
     (``DISTILLED_SIGMA_VALUES``, 8 inference steps, ``guidance_scale=1.0``)
     are injected by :class:`LightricksDistilledMixin`; everything else is
     inherited unchanged from :class:`LTX23Pipeline`.
+    """
+
+
+class LTX23ImageToVideoDistilledPipeline(LightricksDistilledMixin, LTX23ImageToVideoPipeline):
+    """LTX-2.3 8-step Lightricks-distilled I2V variant.
+
+    Targets ``diffusers/LTX-2.3-Distilled-Diffusers`` with an input image as
+    the first-frame condition. Distilled defaults are injected by
+    :class:`LightricksDistilledMixin`; the full I2V conditioning logic
+    (first-frame latent preservation, request parsing) is inherited from
+    :class:`LTX23ImageToVideoPipeline`.
     """
