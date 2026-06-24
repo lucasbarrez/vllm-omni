@@ -18,7 +18,9 @@ from vllm_omni.diffusion.models.ltx2.pipeline_ltx2_3 import (
     LTX23DistilledPipeline,
     LTX23ImageToVideoDistilledPipeline,
     LTX23ImageToVideoPipeline,
+    LTX23ImageToVideoTwoStagesPipeline,
     LTX23Pipeline,
+    LTX23TwoStagesPipeline,
 )
 from vllm_omni.diffusion.models.ltx2.pipeline_ltx2_image2video import (
     LTX2I2VDMD2Pipeline,
@@ -42,6 +44,8 @@ __all__ = [
     "LTX23ConditionPipeline",
     "LTX23ConditionDistilledPipeline",
     "LTX2VideoCondition",
+    "LTX23TwoStagesPipeline",
+    "LTX23ImageToVideoTwoStagesPipeline",
     "LightricksDistilledMixin",
     "get_ltx2_post_process_func",
     "load_transformer_config",

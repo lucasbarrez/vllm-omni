@@ -46,6 +46,8 @@ th {
 | `LTX23ImageToVideoDistilledPipeline` | LTX-2.3-I2V (8-step Lightricks distilled) | `diffusers/LTX-2.3-Distilled-Diffusers` | ✅︎ | ✅︎ | | |
 | `LTX23ConditionPipeline` | LTX-2.3-FLF2V / FMLF (multi-anchor frame conditioning) | `dg845/LTX-2.3-Diffusers` | ✅︎ | ✅︎ | | |
 | `LTX23ConditionDistilledPipeline` | LTX-2.3-FLF2V / FMLF (8-step Lightricks distilled) | `diffusers/LTX-2.3-Distilled-Diffusers` | ✅︎ | ✅︎ | | |
+| `LTX23TwoStagesPipeline` | LTX-2.3-T2V (two-stage 1080p / 1440p refine) | `diffusers/LTX-2.3-Distilled-Diffusers`, `dg845/LTX-2.3-Diffusers` | ✅︎ | ✅︎ | | |
+| `LTX23ImageToVideoTwoStagesPipeline` | LTX-2.3-I2V (two-stage 1080p / 1440p refine, distilled only) | `diffusers/LTX-2.3-Distilled-Diffusers` | ✅︎ | ✅︎ | | |
 | `DreamZeroPipeline` | DreamZero-DROID | `GEAR-Dreams/DreamZero-DROID` | ✅︎ | ✅︎ | ✅︎ | ✅︎ |
 | `HeliosPipeline`, `HeliosPyramidPipeline` | Helios | `BestWishYsh/Helios-Base`, `BestWishYsh/Helios-Mid`, `BestWishYsh/Helios-Distilled` | ✅︎ | ✅︎ | ✅︎ | |
 | `MagiHumanPipeline` | MagiHuman | `SII-GAIR/daVinci-MagiHuman-Base-1080p` | ✅︎ | ✅︎ | | |

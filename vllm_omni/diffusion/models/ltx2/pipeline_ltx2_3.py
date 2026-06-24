@@ -27,6 +27,7 @@ import PIL.Image
 import torch
 from diffusers import AutoencoderKLLTX2Audio, FlowMatchEulerDiscreteScheduler
 from diffusers.pipelines.ltx2 import LTX2TextConnectors
+from diffusers.pipelines.ltx2.utils import DISTILLED_SIGMA_VALUES, STAGE_2_DISTILLED_SIGMA_VALUES
 from diffusers.pipelines.ltx2.vocoder import LTX2Vocoder
 from diffusers.pipelines.stable_diffusion.pipeline_stable_diffusion import retrieve_timesteps
 from diffusers.pipelines.stable_diffusion.pipeline_stable_diffusion_img2img import retrieve_latents
@@ -47,6 +48,7 @@ from vllm_omni.diffusion.distributed.parallel_state import (
     get_classifier_free_guidance_world_size,
 )
 from vllm_omni.diffusion.distributed.utils import get_local_device
+from vllm_omni.diffusion.lora.manager import DiffusionLoRAManager
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
 from vllm_omni.diffusion.model_loader.hub_prefetch import from_pretrained_with_prefetch, prefetch_subfolders
 from vllm_omni.diffusion.models.interface import SupportsComponentDiscovery
@@ -54,8 +56,10 @@ from vllm_omni.diffusion.models.progress_bar import ProgressBarMixin
 from vllm_omni.diffusion.offloader.module_collector import ModuleDiscovery
 from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import DiffusionPipelineProfilerMixin
 from vllm_omni.diffusion.request import OmniDiffusionRequest
+from vllm_omni.lora.request import LoRARequest
 
 from .distilled_mixin import LightricksDistilledMixin
+from .pipeline_ltx2_latent_upsample import LTX2LatentUpsamplePipeline
 from .pipeline_ltx2 import (
     _get_prompt_field,
     _VideoAudioScheduler,
@@ -2339,3 +2343,274 @@ class LTX23ConditionDistilledPipeline(LightricksDistilledMixin, LTX23ConditionPi
     with the multi-anchor FLF2V / FMLF logic from
     :class:`LTX23ConditionPipeline`.
     """
+
+
+# ----------------------------------------------------------------------------
+# Two-Stage pipelines (1080p / 1440p quality refine)
+# ----------------------------------------------------------------------------
+#
+# Mirror of the LTX-2 two-stage precedent (PR #2260) for LTX-2.3:
+#   1. Stage 1 generates a half-res latent via LTX23Pipeline with the
+#      ``DISTILLED_SIGMA_VALUES`` schedule (8 steps).
+#   2. ``LTX2LatentUpsamplePipeline`` upsamples the latent 2x spatially
+#      (the upsampler is shared with LTX-2 — same VAE family).
+#   3. Stage 2 refines at full res with ``STAGE_2_DISTILLED_SIGMA_VALUES``
+#      (3 steps, guidance_scale=1.0).
+#
+# When the model path contains "distilled" we skip the stage-2 LoRA load
+# (the underlying transformer is already distilled). Otherwise we load
+# ``ltx-2.3-22b-distilled-lora-384-1.1.safetensors`` from the model path.
+
+
+class LTX23TwoStagesPipeline(nn.Module, SupportsComponentDiscovery):
+    """LTX-2.3 two-stage T2V pipeline (1080p / 1440p refine).
+
+    Composes :class:`LTX23Pipeline` with the LTX-2 latent upsampler. Stage 1
+    runs at half res with the Lightricks distilled sigma schedule; stage 2
+    refines at full res with the stage-2 distilled sigmas.
+
+    Mirrors :class:`LTX2TwoStagesPipeline` (PR #2260) for LTX-2.3. The
+    auto-detection of distilled vs dev paths is by basename match on the
+    model path, matching the LTX-2 convention; pointing at the Lightricks
+    dev BF16 repo causes the stage-2 LoRA to be loaded automatically.
+    """
+
+    dummy_run_num_frames = 2
+
+    _dit_modules: ClassVar[list[str]] = ["pipe.transformer"]
+    _encoder_modules: ClassVar[list[str]] = ["pipe.text_encoder"]
+    _vae_modules: ClassVar[list[str]] = ["pipe.vae", "pipe.audio_vae"]
+
+    _STAGE_2_LORA_FILENAME: ClassVar[str] = "ltx-2.3-22b-distilled-lora-384-1.1.safetensors"
+
+    def __init__(self, *, od_config: OmniDiffusionConfig, prefix: str = ""):
+        super().__init__()
+        self.device = get_local_device()
+        self.dtype = getattr(od_config, "dtype", torch.bfloat16)
+        self.model_path = od_config.model
+        self.distilled = "distilled" in os.path.basename(os.path.normpath(self.model_path)).lower()
+
+        self.pipe = LTX23Pipeline(od_config=od_config, prefix=prefix)
+        self.upsample_pipe = LTX2LatentUpsamplePipeline(vae=self.pipe.vae, od_config=od_config)
+
+        self.lora_manager = DiffusionLoRAManager(
+            pipeline=self.pipe,
+            device=self.device,
+            dtype=self.dtype,
+            max_cached_adapters=od_config.max_cpu_loras,
+        )
+
+        self.weights_sources = [
+            DiffusersPipelineLoader.ComponentSource(
+                model_or_path=od_config.model,
+                subfolder="transformer",
+                revision=None,
+                prefix="pipe.transformer.",
+                fall_back_to_pt=True,
+            ),
+        ]
+
+    @torch.no_grad()
+    def forward(
+        self,
+        req: OmniDiffusionRequest,
+        prompt: str | list[str] | None = None,
+        negative_prompt: str | list[str] | None = None,
+        height: int | None = None,
+        width: int | None = None,
+        num_frames: int | None = None,
+        frame_rate: float | None = None,
+        num_inference_steps: int | None = None,
+        timesteps: list[int] | None = None,
+        guidance_scale: float = 4.0,
+        noise_scale: float = 0.0,
+        num_videos_per_prompt: int | None = 1,
+        generator: torch.Generator | list[torch.Generator] | None = None,
+        latents: torch.Tensor | None = None,
+        audio_latents: torch.Tensor | None = None,
+        prompt_embeds: torch.Tensor | None = None,
+        negative_prompt_embeds: torch.Tensor | None = None,
+        prompt_attention_mask: torch.Tensor | None = None,
+        negative_prompt_attention_mask: torch.Tensor | None = None,
+        decode_timestep: float | list[float] = 0.0,
+        decode_noise_scale: float | list[float] | None = None,
+        output_type: str = "np",
+        return_dict: bool = True,
+        attention_kwargs: dict[str, Any] | None = None,
+        max_sequence_length: int | None = None,
+    ) -> DiffusionOutput:
+        # Stage 1: half-res latent with distilled schedule.
+        video_latent, audio_latent = self.pipe(
+            req=req,
+            prompt=prompt,
+            negative_prompt=negative_prompt,
+            height=height,
+            width=width,
+            num_frames=num_frames,
+            frame_rate=frame_rate,
+            num_inference_steps=num_inference_steps,
+            sigmas=DISTILLED_SIGMA_VALUES if self.distilled else None,
+            timesteps=timesteps,
+            guidance_scale=guidance_scale,
+            noise_scale=noise_scale,
+            num_videos_per_prompt=num_videos_per_prompt,
+            generator=generator,
+            latents=latents,
+            audio_latents=audio_latents,
+            prompt_embeds=prompt_embeds,
+            negative_prompt_embeds=negative_prompt_embeds,
+            prompt_attention_mask=prompt_attention_mask,
+            negative_prompt_attention_mask=negative_prompt_attention_mask,
+            decode_timestep=decode_timestep,
+            decode_noise_scale=decode_noise_scale,
+            output_type="latent",
+            return_dict=return_dict,
+            attention_kwargs=attention_kwargs,
+            max_sequence_length=max_sequence_length,
+        ).output
+
+        # Latent upsample 2x.
+        upscaled_video_latent = self.upsample_pipe(
+            latents=video_latent,
+            output_type="latent",
+            return_dict=False,
+        )[0]
+
+        # For dev (non-distilled) checkpoints, load the stage-2 distilled LoRA.
+        if not self.distilled:
+            lora_path = f"{self.model_path}/{self._STAGE_2_LORA_FILENAME}"
+            lora_request = LoRARequest(
+                lora_name="stage_2_distilled",
+                lora_int_id=1,
+                lora_path=lora_path,
+            )
+            self.lora_manager.set_active_adapter(lora_request, lora_scale=1.0)
+
+            new_scheduler = FlowMatchEulerDiscreteScheduler.from_config(
+                self.pipe.scheduler.config,
+                use_dynamic_shifting=False,
+                shift_terminal=None,
+            )
+            self.pipe.scheduler = new_scheduler
+
+        # Stage 2: full-res refine with stage-2 distilled sigmas.
+        stage_2_req = copy.copy(req)
+        stage_2_req.sampling_params = req.sampling_params.clone()
+        stage_2_req.sampling_params.num_inference_steps = len(STAGE_2_DISTILLED_SIGMA_VALUES)
+
+        video, audio = self.pipe(
+            req=stage_2_req,
+            latents=upscaled_video_latent,
+            audio_latents=audio_latent,
+            prompt=prompt,
+            negative_prompt=negative_prompt,
+            noise_scale=STAGE_2_DISTILLED_SIGMA_VALUES[0],
+            sigmas=STAGE_2_DISTILLED_SIGMA_VALUES,
+            guidance_scale=1.0,
+            generator=generator,
+            output_type="np",
+            return_dict=False,
+        ).output
+
+        return DiffusionOutput(output=(video, audio))
+
+    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+        loader = AutoWeightsLoader(self)
+        return loader.load_weights(weights)
+
+
+class LTX23ImageToVideoTwoStagesPipeline(nn.Module, SupportsComponentDiscovery):
+    """LTX-2.3 two-stage I2V pipeline (1080p / 1440p refine).
+
+    Same composition as :class:`LTX23TwoStagesPipeline` but wraps
+    :class:`LTX23ImageToVideoPipeline` (from PR #4381) for first-frame
+    image conditioning. Currently only supports distilled checkpoints —
+    pointing at a dev path raises ``NotImplementedError`` to match the
+    LTX-2 I2V two-stage convention.
+    """
+
+    support_image_input = True
+    dummy_run_num_frames = 2
+
+    _dit_modules: ClassVar[list[str]] = ["pipe.transformer"]
+    _encoder_modules: ClassVar[list[str]] = ["pipe.text_encoder"]
+    _vae_modules: ClassVar[list[str]] = ["pipe.vae", "pipe.audio_vae"]
+
+    def __init__(self, *, od_config: OmniDiffusionConfig, prefix: str = ""):
+        super().__init__()
+        self.device = get_local_device()
+        self.dtype = getattr(od_config, "dtype", torch.bfloat16)
+        self.model_path = od_config.model
+
+        if "distilled" not in os.path.basename(os.path.normpath(self.model_path)).lower():
+            raise NotImplementedError(
+                f"{self.model_path} is not supported for {self.__class__.__name__}: "
+                "LTX-2.3 I2V two-stage currently requires a distilled checkpoint."
+            )
+        self.distilled = True
+
+        self.pipe = LTX23ImageToVideoPipeline(od_config=od_config, prefix=prefix)
+        self.upsample_pipe = LTX2LatentUpsamplePipeline(vae=self.pipe.vae, od_config=od_config)
+
+        self.lora_manager = DiffusionLoRAManager(
+            pipeline=self.pipe,
+            device=self.device,
+            dtype=self.dtype,
+            max_cached_adapters=od_config.max_cpu_loras,
+        )
+
+        self.weights_sources = [
+            DiffusersPipelineLoader.ComponentSource(
+                model_or_path=od_config.model,
+                subfolder="transformer",
+                revision=None,
+                prefix="pipe.transformer.",
+                fall_back_to_pt=True,
+            ),
+        ]
+
+    @torch.no_grad()
+    def forward(
+        self,
+        req: OmniDiffusionRequest,
+        image: PIL.Image.Image | torch.Tensor | list[PIL.Image.Image | torch.Tensor] | None = None,
+        **kwargs: Any,
+    ) -> DiffusionOutput:
+        # Stage 1: half-res latent with distilled schedule.
+        video_latent, audio_latent = self.pipe(
+            req=req,
+            image=image,
+            sigmas=DISTILLED_SIGMA_VALUES,
+            output_type="latent",
+            return_dict=False,
+            **kwargs,
+        ).output
+
+        upscaled_video_latent = self.upsample_pipe(
+            latents=video_latent,
+            output_type="latent",
+            return_dict=False,
+        )[0]
+
+        # Stage 2: full-res refine.
+        stage_2_req = copy.copy(req)
+        stage_2_req.sampling_params = req.sampling_params.clone()
+        stage_2_req.sampling_params.num_inference_steps = len(STAGE_2_DISTILLED_SIGMA_VALUES)
+
+        video, audio = self.pipe(
+            req=stage_2_req,
+            image=image,
+            latents=upscaled_video_latent,
+            audio_latents=audio_latent,
+            noise_scale=STAGE_2_DISTILLED_SIGMA_VALUES[0],
+            sigmas=STAGE_2_DISTILLED_SIGMA_VALUES,
+            guidance_scale=1.0,
+            output_type="np",
+            return_dict=False,
+        ).output
+
+        return DiffusionOutput(output=(video, audio))
+
+    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+        loader = AutoWeightsLoader(self)
+        return loader.load_weights(weights)

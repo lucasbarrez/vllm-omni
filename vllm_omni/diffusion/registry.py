@@ -126,6 +126,16 @@ _DIFFUSION_MODELS = {
         "pipeline_ltx2_3",
         "LTX23ConditionDistilledPipeline",
     ),
+    "LTX23TwoStagesPipeline": (
+        "ltx2",
+        "pipeline_ltx2_3",
+        "LTX23TwoStagesPipeline",
+    ),
+    "LTX23ImageToVideoTwoStagesPipeline": (
+        "ltx2",
+        "pipeline_ltx2_3",
+        "LTX23ImageToVideoTwoStagesPipeline",
+    ),
     "StableAudioPipeline": (
         "stable_audio",
         "pipeline_stable_audio",
@@ -507,6 +517,8 @@ _DIFFUSION_POST_PROCESS_FUNCS = {
     "LTX23ImageToVideoDistilledPipeline": "get_ltx2_post_process_func",
     "LTX23ConditionPipeline": "get_ltx2_post_process_func",
     "LTX23ConditionDistilledPipeline": "get_ltx2_post_process_func",
+    "LTX23TwoStagesPipeline": "get_ltx2_post_process_func",
+    "LTX23ImageToVideoTwoStagesPipeline": "get_ltx2_post_process_func",
     "StableAudioPipeline": "get_stable_audio_post_process_func",
     "AudioXPipeline": "get_audiox_post_process_func",
     "WanImageToVideoPipeline": "get_wan22_i2v_post_process_func",
