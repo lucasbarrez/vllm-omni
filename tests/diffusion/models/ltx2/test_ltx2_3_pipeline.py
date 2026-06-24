@@ -16,6 +16,7 @@ import json
 import os
 import tempfile
 from types import SimpleNamespace
+from typing import Any
 
 import pytest
 import torch
@@ -300,7 +301,7 @@ class TestLTX23ImageToVideoPipeline:
 
         latents = torch.tensor([[[10.0, 11.0], [20.0, 21.0], [30.0, 31.0]]])
 
-        out, conditioning_mask = pipe.prepare_latents(
+        out, conditioning_mask = pipe.prepare_image_to_video_latents(
             image=None,
             batch_size=1,
             num_channels_latents=2,
@@ -344,6 +345,117 @@ class TestLTX23ImageToVideoPipeline:
 
         torch.testing.assert_close(out[:, :1], latents[:, :1])
         torch.testing.assert_close(out[:, 1:], latents[:, 1:] + noise_pred[:, 1:] + 0.5)
+
+    def test_i2v_build_video_timestep_masks_first_frame(self):
+        """I2V's video-timestep hook zeros the conditioned tokens (first frame)."""
+        from vllm_omni.diffusion.models.ltx2.pipeline_ltx2_3 import LTX23ImageToVideoPipeline
+
+        pipe = object.__new__(LTX23ImageToVideoPipeline)
+        # I2V mask is binary (1 at first-frame tokens, 0 elsewhere).
+        pipe._conditioning_mask = torch.tensor([[1.0, 0.0, 0.0]])
+
+        ts = torch.tensor([7.0])
+        out = pipe._build_video_timestep(ts)
+
+        torch.testing.assert_close(out, torch.tensor([[0.0, 7.0, 7.0]]))
+
+    def test_i2v_build_video_timestep_handles_cfg_batch_doubling(self):
+        """When CFG doubles the batch (non-CFG-parallel path), the hook
+        broadcasts the mask along the batch dim."""
+        from vllm_omni.diffusion.models.ltx2.pipeline_ltx2_3 import LTX23ImageToVideoPipeline
+
+        pipe = object.__new__(LTX23ImageToVideoPipeline)
+        pipe._conditioning_mask = torch.tensor([[1.0, 0.0]])
+
+        ts = torch.tensor([7.0, 7.0])
+        out = pipe._build_video_timestep(ts)
+
+        torch.testing.assert_close(out, torch.tensor([[0.0, 7.0], [0.0, 7.0]]))
+
+    def test_i2v_prepare_latents_adapter_stashes_mask(self, monkeypatch):
+        """The base-compatible prepare_latents adapter pulls image from
+        self._pending_image, calls prepare_image_to_video_latents, and stashes
+        the mask on self._conditioning_mask."""
+        from vllm_omni.diffusion.models.ltx2.pipeline_ltx2_3 import LTX23ImageToVideoPipeline
+
+        pipe = object.__new__(LTX23ImageToVideoPipeline)
+        pipe._pending_image = "stand-in-image"
+
+        seen: dict[str, Any] = {}
+        sentinel_latents = torch.zeros(1, 3, 4)
+        sentinel_mask = torch.tensor([[1.0, 0.0, 0.0, 0.0]])
+
+        def fake_prepare(self, *, image, **kwargs):
+            seen["image"] = image
+            seen["kwargs"] = kwargs
+            return sentinel_latents, sentinel_mask
+
+        monkeypatch.setattr(
+            LTX23ImageToVideoPipeline, "prepare_image_to_video_latents", fake_prepare
+        )
+
+        out = pipe.prepare_latents(
+            batch_size=1,
+            num_channels_latents=2,
+            height=8,
+            width=8,
+            num_frames=3,
+        )
+
+        assert seen["image"] == "stand-in-image"
+        assert out is sentinel_latents
+        assert pipe._conditioning_mask is sentinel_mask
+
+    def test_i2v_prepare_image_to_video_latents_casts_image_to_vae_dtype(self, monkeypatch):
+        """The image must be cast to vae.dtype before vae.encode.
+
+        Regression: passing the latent dtype (typically float32) here trips
+        the VAE conv layers with "Input type (float) and bias type
+        (c10::BFloat16) should be the same" at engine warmup.
+        """
+        from vllm_omni.diffusion.models.ltx2 import pipeline_ltx2_3 as ltx23
+
+        pipe = object.__new__(ltx23.LTX23ImageToVideoPipeline)
+        torch.nn.Module.__init__(pipe)
+        pipe.vae_spatial_compression_ratio = 32
+        pipe.vae_temporal_compression_ratio = 1
+        pipe.transformer_spatial_patch_size = 1
+        pipe.transformer_temporal_patch_size = 1
+
+        seen_encode_dtypes: list[torch.dtype] = []
+
+        def fake_encode(x):
+            seen_encode_dtypes.append(x.dtype)
+            return SimpleNamespace(
+                latent_dist=SimpleNamespace(mode=lambda: torch.zeros(1, 4, 1, 1, 1, dtype=x.dtype))
+            )
+
+        pipe.vae = SimpleNamespace(
+            dtype=torch.bfloat16,
+            encode=fake_encode,
+            latents_mean=torch.zeros(4),
+            latents_std=torch.ones(4),
+            config=SimpleNamespace(scaling_factor=1.0),
+        )
+        monkeypatch.setattr(ltx23, "retrieve_latents", lambda enc, generator, sample_mode: enc.latent_dist.mode())
+
+        image = torch.randn(1, 3, 32, 32, dtype=torch.float32)
+        latents, mask = pipe.prepare_image_to_video_latents(
+            image=image,
+            batch_size=1,
+            num_channels_latents=4,
+            height=32,
+            width=32,
+            num_frames=1,
+            dtype=torch.float32,
+            device=torch.device("cpu"),
+        )
+
+        assert seen_encode_dtypes == [torch.bfloat16], (
+            f"vae.encode must receive vae.dtype, got {seen_encode_dtypes}"
+        )
+        # Latents themselves come back in the requested latent dtype.
+        assert latents.dtype == torch.float32
 
 
 class TestLTX23DecodeConditioning:
@@ -850,6 +962,13 @@ class TestCFGParallelForwardPath:
                 torch.testing.assert_close(kwargs["audio_encoder_hidden_states"], expected_prompt)
                 assert kwargs["hidden_states"].shape == (1, 1, 2)
                 assert kwargs["audio_hidden_states"].shape == (1, 1, 2)
+                # Regression guard: audio_timestep must be a scalar (B,), not the
+                # per-token video timestep. The transformer would otherwise fall
+                # back to `timestep` which the I2V hook makes per-token.
+                assert "audio_timestep" in kwargs, "base forward must pass audio_timestep explicitly"
+                assert kwargs["audio_timestep"].ndim == 1, (
+                    f"audio_timestep must be scalar (B,), got shape {tuple(kwargs['audio_timestep'].shape)}"
+                )
                 if cfg_rank == 0:
                     return video_pos, audio_pos
                 return video_neg, audio_neg
@@ -1543,3 +1662,524 @@ class TestLTX23ImageToVideoDistilledPipeline:
         assert captured["sigmas"] is DISTILLED_SIGMA_VALUES
         assert captured["num_inference_steps"] == 8
         assert captured["guidance_scale"] == 1.0
+
+
+class TestLTX2VideoCondition:
+    """Tests for the LTX2VideoCondition dataclass."""
+
+    def test_default_values(self):
+        from vllm_omni.diffusion.models.ltx2.pipeline_ltx2_3 import LTX2VideoCondition
+
+        dummy = SimpleNamespace()  # any object stands in for the frames field
+        cond = LTX2VideoCondition(frames=dummy)
+        assert cond.index == 0
+        assert cond.strength == 1.0
+        assert cond.frames is dummy
+
+
+class TestPreprocessConditions:
+    """Tests for the _preprocess_conditions helper."""
+
+    def _stub_video_processor(self, observed: list):
+        class _StubProcessor:
+            def preprocess_video(self, frames, height, width):
+                observed.append((frames, height, width))
+                tensor = torch.zeros(1)
+                return tensor
+
+        return _StubProcessor()
+
+    def test_empty_conditions_raises(self):
+        from vllm_omni.diffusion.models.ltx2.pipeline_ltx2_3 import _preprocess_conditions
+
+        with pytest.raises(ValueError, match="at least one condition"):
+            _preprocess_conditions(
+                [],
+                self._stub_video_processor([]),
+                height=64,
+                width=64,
+                latent_num_frames=4,
+                device=torch.device("cpu"),
+                dtype=torch.float32,
+            )
+
+    def test_out_of_range_index_raises(self):
+        from vllm_omni.diffusion.models.ltx2.pipeline_ltx2_3 import LTX2VideoCondition, _preprocess_conditions
+
+        with pytest.raises(ValueError, match="outside the valid range"):
+            _preprocess_conditions(
+                [LTX2VideoCondition(frames=SimpleNamespace(), index=10)],
+                self._stub_video_processor([]),
+                height=64,
+                width=64,
+                latent_num_frames=4,
+                device=torch.device("cpu"),
+                dtype=torch.float32,
+            )
+
+    def test_invalid_strength_raises(self):
+        from vllm_omni.diffusion.models.ltx2.pipeline_ltx2_3 import LTX2VideoCondition, _preprocess_conditions
+
+        with pytest.raises(ValueError, match="strength must be in"):
+            _preprocess_conditions(
+                [LTX2VideoCondition(frames=SimpleNamespace(), index=0, strength=1.5)],
+                self._stub_video_processor([]),
+                height=64,
+                width=64,
+                latent_num_frames=4,
+                device=torch.device("cpu"),
+                dtype=torch.float32,
+            )
+
+    def test_negative_index_resolves_against_num_frames(self):
+        from vllm_omni.diffusion.models.ltx2.pipeline_ltx2_3 import LTX2VideoCondition, _preprocess_conditions
+
+        observed: list = []
+        _, _, indices = _preprocess_conditions(
+            [
+                LTX2VideoCondition(frames=SimpleNamespace(), index=0),
+                LTX2VideoCondition(frames=SimpleNamespace(), index=-1),
+            ],
+            self._stub_video_processor(observed),
+            height=64,
+            width=64,
+            latent_num_frames=5,
+            device=torch.device("cpu"),
+            dtype=torch.float32,
+        )
+        assert indices == [0, 4]
+
+
+class TestApplyVisualConditioning:
+    """Tests for the apply_visual_conditioning static method."""
+
+    def test_writes_at_correct_token_offsets(self):
+        from vllm_omni.diffusion.models.ltx2.pipeline_ltx2_3 import LTX23ConditionPipeline
+
+        # Latents: [B=1, seq=10, dim=2]. Use a 5x2 grid (latent_height * latent_width = 10).
+        latents = torch.zeros(1, 10, 2)
+        mask = torch.zeros(1, 10, 1)
+        cond = torch.full((1, 2, 2), 7.0)  # 2 tokens of value 7.0
+
+        latents_out, mask_out, clean_out = LTX23ConditionPipeline.apply_visual_conditioning(
+            latents,
+            mask,
+            condition_latents=[cond],
+            condition_strengths=[1.0],
+            condition_indices=[1],
+            latent_height=1,
+            latent_width=2,
+        )
+
+        # latent_idx=1 * latent_height=1 * latent_width=2 = 2 → tokens [2:4]
+        assert torch.allclose(latents_out[:, 2:4], torch.full((1, 2, 2), 7.0))
+        assert torch.allclose(mask_out[:, 2:4], torch.ones(1, 2, 1))
+        assert torch.allclose(clean_out[:, 2:4], torch.full((1, 2, 2), 7.0))
+        # Outside the conditioned region: unchanged.
+        assert torch.allclose(latents_out[:, :2], torch.zeros(1, 2, 2))
+        assert torch.allclose(latents_out[:, 4:], torch.zeros(1, 6, 2))
+
+
+class TestLTX23ConditionPipeline:
+    """Tests for the LTX-2.3 multi-anchor frame conditioning pipeline."""
+
+    def test_subclasses_ltx23_pipeline(self):
+        from vllm_omni.diffusion.models.ltx2.pipeline_ltx2_3 import LTX23ConditionPipeline, LTX23Pipeline
+
+        assert issubclass(LTX23ConditionPipeline, LTX23Pipeline)
+
+    def test_registered_in_diffusion_models(self):
+        from vllm_omni.diffusion.registry import _DIFFUSION_MODELS
+
+        assert _DIFFUSION_MODELS["LTX23ConditionPipeline"] == (
+            "ltx2",
+            "pipeline_ltx2_3",
+            "LTX23ConditionPipeline",
+        )
+
+    def test_post_process_func_registered(self):
+        from vllm_omni.diffusion.registry import _DIFFUSION_POST_PROCESS_FUNCS
+
+        assert (
+            _DIFFUSION_POST_PROCESS_FUNCS["LTX23ConditionPipeline"]
+            == "get_ltx2_post_process_func"
+        )
+
+    def test_exported_from_ltx2_package(self):
+        from vllm_omni.diffusion.models import ltx2
+
+        for name in ("LTX23ConditionPipeline", "LTX2VideoCondition"):
+            assert hasattr(ltx2, name), f"{name} not exported"
+            assert name in ltx2.__all__, f"{name} not in __all__"
+
+    def test_forward_falls_back_to_t2v_when_no_conditions(self, monkeypatch):
+        """With conditions=None or [], the pipeline behaves like LTX23Pipeline."""
+        from vllm_omni.diffusion.models.ltx2.pipeline_ltx2_3 import LTX23ConditionPipeline, LTX23Pipeline
+
+        called = {}
+
+        def fake_super_forward(self, req, **kwargs):
+            called["yes"] = True
+            return SimpleNamespace(output=("video", "audio"))
+
+        monkeypatch.setattr(LTX23Pipeline, "forward", fake_super_forward)
+
+        pipe = object.__new__(LTX23ConditionPipeline)
+        # `prompts=[]` keeps the request-side resolver a no-op so the kwarg path
+        # is the only signal in this test.
+        req = SimpleNamespace(prompts=[])
+
+        pipe.forward(req, conditions=None)
+        assert called == {"yes": True}
+
+        called.clear()
+        pipe.forward(req, conditions=[])
+        assert called == {"yes": True}
+
+    def test_forward_stashes_conditions_before_delegating(self, monkeypatch):
+        """With non-empty conditions, forward stashes them on self and delegates
+        to LTX23Pipeline.forward so the hooks pick them up."""
+        from vllm_omni.diffusion.models.ltx2.pipeline_ltx2_3 import (
+            LTX23ConditionPipeline,
+            LTX23Pipeline,
+            LTX2VideoCondition,
+        )
+
+        seen: dict[str, Any] = {}
+
+        def fake_super_forward(self, req, **kwargs):
+            seen["pending"] = self._pending_conditions
+            return SimpleNamespace(output=("video", "audio"))
+
+        monkeypatch.setattr(LTX23Pipeline, "forward", fake_super_forward)
+
+        pipe = object.__new__(LTX23ConditionPipeline)
+        req = SimpleNamespace(prompts=[])
+        conditions = [LTX2VideoCondition(frames=SimpleNamespace())]
+
+        pipe.forward(req, conditions=conditions)
+        assert seen["pending"] is conditions
+        # State is cleaned up after forward returns.
+        assert pipe._pending_conditions is None
+        assert pipe._conditioning_mask is None
+        assert pipe._clean_latents is None
+
+    def test_resolve_conditions_from_request_duck_types_anchors(self):
+        """`_resolve_conditions_from_request` accepts any object exposing
+        ``data`` / ``index`` / ``strength`` (the ReferenceConditionAnchor shape
+        the serving layer stashes in multi_modal_data)."""
+        from vllm_omni.diffusion.models.ltx2.pipeline_ltx2_3 import (
+            LTX23ConditionPipeline,
+            LTX2VideoCondition,
+        )
+
+        anchor_first = SimpleNamespace(data="<first-pil>", index=0, strength=1.0)
+        anchor_last = SimpleNamespace(data="<last-pil>", index=-1, strength=0.5)
+        req = SimpleNamespace(
+            prompts=[{"multi_modal_data": {"conditions": [anchor_first, anchor_last]}}]
+        )
+
+        resolved = LTX23ConditionPipeline._resolve_conditions_from_request(req)
+        assert resolved is not None
+        assert len(resolved) == 2
+        assert all(isinstance(c, LTX2VideoCondition) for c in resolved)
+        assert resolved[0].frames == "<first-pil>"
+        assert resolved[0].index == 0
+        assert resolved[0].strength == 1.0
+        assert resolved[1].index == -1
+        assert resolved[1].strength == 0.5
+
+    def test_resolve_conditions_passes_through_ltx2videocondition(self):
+        """Pre-built LTX2VideoCondition instances are passed through unchanged."""
+        from vllm_omni.diffusion.models.ltx2.pipeline_ltx2_3 import (
+            LTX23ConditionPipeline,
+            LTX2VideoCondition,
+        )
+
+        cond = LTX2VideoCondition(frames=SimpleNamespace(), index=3, strength=0.8)
+        req = SimpleNamespace(prompts=[{"multi_modal_data": {"conditions": [cond]}}])
+
+        resolved = LTX23ConditionPipeline._resolve_conditions_from_request(req)
+        assert resolved == [cond]
+        # Same object: pipeline didn't copy or rewrap.
+        assert resolved[0] is cond
+
+    def test_resolve_conditions_returns_none_when_absent(self):
+        """No conditions stashed → resolver returns None (no exception)."""
+        from vllm_omni.diffusion.models.ltx2.pipeline_ltx2_3 import LTX23ConditionPipeline
+
+        # Empty prompts list.
+        assert LTX23ConditionPipeline._resolve_conditions_from_request(
+            SimpleNamespace(prompts=[])
+        ) is None
+
+        # multi_modal_data missing the key.
+        req = SimpleNamespace(prompts=[{"multi_modal_data": {"image": "<some>"}}])
+        assert LTX23ConditionPipeline._resolve_conditions_from_request(req) is None
+
+        # String prompt (chat-style).
+        assert LTX23ConditionPipeline._resolve_conditions_from_request(
+            SimpleNamespace(prompts=["a plain string prompt"])
+        ) is None
+
+    def test_forward_reads_conditions_from_request_when_kwarg_absent(self, monkeypatch):
+        """The HTTP path stashes anchors in multi_modal_data; forward must pick
+        them up when no `conditions` kwarg is supplied (which is what
+        DiffusionEngine.run does)."""
+        from vllm_omni.diffusion.models.ltx2.pipeline_ltx2_3 import (
+            LTX23ConditionPipeline,
+            LTX23Pipeline,
+            LTX2VideoCondition,
+        )
+
+        seen: dict[str, Any] = {}
+
+        def fake_super_forward(self, req, **kwargs):
+            seen["pending"] = self._pending_conditions
+            return SimpleNamespace(output=("video", "audio"))
+
+        monkeypatch.setattr(LTX23Pipeline, "forward", fake_super_forward)
+
+        pipe = object.__new__(LTX23ConditionPipeline)
+        anchor = SimpleNamespace(data="<pil-image>", index=0, strength=1.0)
+        req = SimpleNamespace(prompts=[{"multi_modal_data": {"conditions": [anchor]}}])
+
+        pipe.forward(req)  # no kwarg!
+
+        pending = seen["pending"]
+        assert pending is not None
+        assert len(pending) == 1
+        assert isinstance(pending[0], LTX2VideoCondition)
+        assert pending[0].frames == "<pil-image>"
+
+    def test_forward_kwarg_conditions_take_precedence_over_request(self, monkeypatch):
+        """Explicit kwarg conditions win over any request-side anchors."""
+        from vllm_omni.diffusion.models.ltx2.pipeline_ltx2_3 import (
+            LTX23ConditionPipeline,
+            LTX23Pipeline,
+            LTX2VideoCondition,
+        )
+
+        seen: dict[str, Any] = {}
+
+        def fake_super_forward(self, req, **kwargs):
+            seen["pending"] = self._pending_conditions
+            return SimpleNamespace(output=("video", "audio"))
+
+        monkeypatch.setattr(LTX23Pipeline, "forward", fake_super_forward)
+
+        pipe = object.__new__(LTX23ConditionPipeline)
+        req_anchor = SimpleNamespace(data="<req-pil>", index=0, strength=1.0)
+        req = SimpleNamespace(prompts=[{"multi_modal_data": {"conditions": [req_anchor]}}])
+        explicit = [LTX2VideoCondition(frames="<explicit>", index=5, strength=0.3)]
+
+        pipe.forward(req, conditions=explicit)
+
+        assert seen["pending"] is explicit
+        assert seen["pending"][0].frames == "<explicit>"
+
+    def test_build_video_timestep_masks_conditioned_tokens(self):
+        """The video-timestep hook should zero out conditioned tokens and pass
+        the scalar timestep through for unconditioned tokens."""
+        from vllm_omni.diffusion.models.ltx2.pipeline_ltx2_3 import LTX23ConditionPipeline
+
+        pipe = object.__new__(LTX23ConditionPipeline)
+        # mask shape (B, N): token 0 fully conditioned, token 1 half-strength,
+        # token 2 unconditioned.
+        pipe._conditioning_mask = torch.tensor([[1.0, 0.5, 0.0]])
+
+        ts = torch.tensor([10.0])
+        out = pipe._build_video_timestep(ts)
+
+        # (1, 1) * (1 - (1, 3)) = (1, 3) per-token timestep.
+        torch.testing.assert_close(out, torch.tensor([[0.0, 5.0, 10.0]]))
+
+    def test_build_video_timestep_duplicates_mask_for_non_parallel_cfg(self):
+        """When ts is CFG-duplicated (batch x2) but the mask isn't, the hook
+        broadcasts the mask along the batch dim."""
+        from vllm_omni.diffusion.models.ltx2.pipeline_ltx2_3 import LTX23ConditionPipeline
+
+        pipe = object.__new__(LTX23ConditionPipeline)
+        pipe._conditioning_mask = torch.tensor([[1.0, 0.0]])  # (1, 2)
+
+        ts = torch.tensor([10.0, 10.0])  # (2,) — CFG batch=2
+        out = pipe._build_video_timestep(ts)
+
+        torch.testing.assert_close(
+            out, torch.tensor([[0.0, 10.0], [0.0, 10.0]])
+        )
+
+    def test_build_video_timestep_passthrough_without_mask(self):
+        """Without a conditioning mask stashed, the hook is a passthrough so
+        the T2V code path is unaffected."""
+        from vllm_omni.diffusion.models.ltx2.pipeline_ltx2_3 import LTX23ConditionPipeline
+
+        pipe = object.__new__(LTX23ConditionPipeline)
+        pipe._conditioning_mask = None
+
+        ts = torch.tensor([1.0, 2.0])
+        out = pipe._build_video_timestep(ts)
+        torch.testing.assert_close(out, ts)
+
+    def test_condition_video_audio_scheduler_blends_in_x0_space(self):
+        """_ConditionVideoAudioScheduler.step applies the x0-blend formula
+            x0_blend = (sample - v*sigma) * (1 - m) + clean * m
+        then converts back to velocity before delegating to scheduler.step."""
+        from vllm_omni.diffusion.models.ltx2.pipeline_ltx2_3 import (
+            LTX23ConditionPipeline,
+            _ConditionVideoAudioScheduler,
+        )
+
+        pipe = object.__new__(LTX23ConditionPipeline)
+        # Single batch, 2 tokens, 1 channel.
+        pipe._conditioning_mask = torch.tensor([[1.0, 0.0]])
+        pipe._clean_latents = torch.tensor([[[7.0], [0.0]]])
+
+        captured = {}
+
+        class FakeVideoScheduler:
+            step_index = 0
+            sigmas = torch.tensor([2.0, 1.0, 0.0])
+
+            def _init_step_index(self, _t):  # pragma: no cover - already set
+                pass
+
+            def step(self, noise_pred, t, latents, return_dict=False, generator=None):
+                captured["video_noise_pred"] = noise_pred
+                return (latents - noise_pred,)
+
+        class FakeAudioScheduler:
+            def step(self, noise_pred, t, latents, return_dict=False, generator=None):
+                return (latents + noise_pred,)
+
+        pipe.scheduler = FakeVideoScheduler()
+        wrapper = _ConditionVideoAudioScheduler(pipe, FakeAudioScheduler())
+
+        # sample at token 0 = 5, token 1 = 3. velocity pred = 0.5 everywhere.
+        # sigma at step 0 = 2.0
+        # x0       = sample - v*sigma = [[[5 - 1.0], [3 - 1.0]]] = [[[4.0], [2.0]]]
+        # mask     = [[1, 0]] → mask_3d = [[[1], [0]]]
+        # blended  = x0 * (1 - mask) + clean * mask = [[[7.0], [2.0]]]
+        # v_corr   = (sample - blended) / sigma = [[[ -1.0], [0.5]]]
+        sample = torch.tensor([[[5.0], [3.0]]])
+        noise_pred_video = torch.tensor([[[0.5], [0.5]]])
+        noise_pred_audio = torch.tensor([[[9.0]]])
+        out, = wrapper.step(
+            (noise_pred_video, noise_pred_audio),
+            (torch.tensor(0.0), torch.tensor(0.0)),
+            (sample, torch.tensor([[[1.0]]])),
+        )
+
+        torch.testing.assert_close(
+            captured["video_noise_pred"], torch.tensor([[[-1.0], [0.5]]])
+        )
+        # video out = sample - v_corr = [[[6.0], [2.5]]]
+        torch.testing.assert_close(out[0], torch.tensor([[[6.0], [2.5]]]))
+
+    def test_prepare_condition_latents_casts_condition_to_vae_dtype(self, monkeypatch):
+        """Each condition_tensor must be cast to vae.dtype before vae.encode.
+
+        Same regression as the I2V image path: passing the latent dtype
+        (float32) here trips the VAE conv layers at engine warmup.
+        """
+        from vllm_omni.diffusion.models.ltx2 import pipeline_ltx2_3 as ltx23
+
+        pipe = object.__new__(ltx23.LTX23ConditionPipeline)
+        torch.nn.Module.__init__(pipe)
+        pipe.vae_spatial_compression_ratio = 32
+        pipe.vae_temporal_compression_ratio = 1
+        pipe.transformer_spatial_patch_size = 1
+        pipe.transformer_temporal_patch_size = 1
+
+        seen_encode_dtypes: list[torch.dtype] = []
+
+        def fake_encode(x):
+            seen_encode_dtypes.append(x.dtype)
+            return SimpleNamespace(
+                latent_dist=SimpleNamespace(mode=lambda: torch.zeros(1, 4, 1, 1, 1, dtype=x.dtype))
+            )
+
+        pipe.vae = SimpleNamespace(
+            dtype=torch.bfloat16,
+            encode=fake_encode,
+            latents_mean=torch.zeros(4),
+            latents_std=torch.ones(4),
+            config=SimpleNamespace(scaling_factor=1.0),
+        )
+        pipe.video_processor = SimpleNamespace()
+
+        condition = ltx23.LTX2VideoCondition(
+            frames=SimpleNamespace(), index=0, strength=1.0
+        )
+
+        def fake_preprocess(conditions, video_processor, height, width, latent_num_frames, *, device, dtype):
+            # Emulate the real path: return a float32 condition tensor.
+            return ([torch.zeros(1, 3, 1, 1, 1, dtype=dtype)], [1.0], [0])
+
+        monkeypatch.setattr(ltx23, "_preprocess_conditions", fake_preprocess)
+        monkeypatch.setattr(ltx23, "retrieve_latents", lambda enc, generator, sample_mode: enc.latent_dist.mode())
+        monkeypatch.setattr(
+            ltx23.LTX23ConditionPipeline,
+            "apply_visual_conditioning",
+            lambda self, latents, mask, *_args, **_kw: (latents, mask, torch.zeros_like(latents)),
+        )
+
+        pipe.prepare_condition_latents(
+            conditions=[condition],
+            batch_size=1,
+            num_channels_latents=4,
+            height=32,
+            width=32,
+            num_frames=1,
+            dtype=torch.float32,
+            device=torch.device("cpu"),
+        )
+
+        assert seen_encode_dtypes == [torch.bfloat16], (
+            f"vae.encode must receive vae.dtype, got {seen_encode_dtypes}"
+        )
+
+
+class TestLTX23ConditionDistilledPipeline:
+    """Tests for the distilled variant composed via the mixin."""
+
+    def test_subclasses_condition_pipeline(self):
+        from vllm_omni.diffusion.models.ltx2.pipeline_ltx2_3 import (
+            LTX23ConditionDistilledPipeline,
+            LTX23ConditionPipeline,
+        )
+
+        assert issubclass(LTX23ConditionDistilledPipeline, LTX23ConditionPipeline)
+
+    def test_mixin_appears_before_base_in_mro(self):
+        from vllm_omni.diffusion.models.ltx2.distilled_mixin import LightricksDistilledMixin
+        from vllm_omni.diffusion.models.ltx2.pipeline_ltx2_3 import (
+            LTX23ConditionDistilledPipeline,
+            LTX23ConditionPipeline,
+        )
+
+        mro = LTX23ConditionDistilledPipeline.__mro__
+        assert mro.index(LightricksDistilledMixin) < mro.index(LTX23ConditionPipeline)
+
+    def test_registered_in_diffusion_models(self):
+        from vllm_omni.diffusion.registry import _DIFFUSION_MODELS
+
+        assert _DIFFUSION_MODELS["LTX23ConditionDistilledPipeline"] == (
+            "ltx2",
+            "pipeline_ltx2_3",
+            "LTX23ConditionDistilledPipeline",
+        )
+
+    def test_post_process_func_registered(self):
+        from vllm_omni.diffusion.registry import _DIFFUSION_POST_PROCESS_FUNCS
+
+        assert (
+            _DIFFUSION_POST_PROCESS_FUNCS["LTX23ConditionDistilledPipeline"]
+            == "get_ltx2_post_process_func"
+        )
+
+    def test_exported_from_ltx2_package(self):
+        from vllm_omni.diffusion.models import ltx2
+
+        assert hasattr(ltx2, "LTX23ConditionDistilledPipeline")
+        assert "LTX23ConditionDistilledPipeline" in ltx2.__all__

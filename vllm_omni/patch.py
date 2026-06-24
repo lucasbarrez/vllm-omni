@@ -415,3 +415,59 @@ def _patch_fp8_use_quack_fused_bias():
 
 
 _patch_fp8_use_quack_fused_bias()
+
+
+# =============================================================================
+# Patch starlette.requests.Request.form to raise the per-field/per-part size cap
+# =============================================================================
+# WHY: Starlette's default ``max_part_size=1 MiB`` is too tight for video
+# endpoints whose form fields can carry several base64-encoded HD images in a
+# single value (FLF2V / FMLF ``conditions``, multi-image ``image_reference``).
+# Two 1024x1024 PNGs in ``conditions`` weigh ~4 MiB of base64 and were getting
+# rejected with "Part exceeded maximum size of 1024KB".
+#
+# WHY NOT at the endpoint: FastAPI's ``Form()`` dependency calls
+# ``request.form()`` without forwarding ``max_part_size``, so the kwarg-default
+# 1 MiB applies regardless of any class-attribute override on MultiPartParser.
+# The smallest surgical knob is ``Request.form`` itself.
+#
+# SCOPE: applies to every Starlette/FastAPI request handled by this process.
+# Endpoints that explicitly call ``request.form(max_part_size=...)`` to enforce
+# a smaller cap are respected (the patch only swaps in our value when the
+# caller leaves the kwarg at Starlette's default).
+#
+# CONFIG: ``VLLM_OMNI_MAX_FORM_PART_SIZE_MB`` (default 16 MiB).
+#
+# FRAGILITY: depends on Starlette keeping ``max_part_size`` as a kwarg on
+# ``Request.form``. If the kwarg name or default value changes upstream the
+# check below stops triggering (the patch falls through to the original
+# behavior) — silent degradation but no incorrect data.
+def _patch_starlette_request_form_size():
+    try:
+        from starlette.requests import Request as _StarletteRequest
+    except ImportError:
+        return
+
+    max_mb = int(os.environ.get("VLLM_OMNI_MAX_FORM_PART_SIZE_MB", 16))
+    max_bytes = max_mb * 1024 * 1024
+    starlette_default = 1024 * 1024  # mirrors starlette.requests.Request.form
+
+    _original_form = _StarletteRequest.form
+
+    def _patched_form(
+        self,
+        *,
+        max_files: int | float = 1000,
+        max_fields: int | float = 1000,
+        max_part_size: int = starlette_default,
+    ):
+        if max_part_size == starlette_default:
+            max_part_size = max_bytes
+        return _original_form(
+            self, max_files=max_files, max_fields=max_fields, max_part_size=max_part_size
+        )
+
+    _StarletteRequest.form = _patched_form  # type: ignore[method-assign]
+
+
+_patch_starlette_request_form_size()

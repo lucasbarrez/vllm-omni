@@ -129,6 +129,7 @@ from vllm_omni.entrypoints.openai.serving_speech_stream import OmniStreamingSpee
 from vllm_omni.entrypoints.openai.serving_video import (
     OmniOpenAIServingVideo,
     ReferenceAudio,
+    ReferenceConditionAnchor,
     ReferenceImage,
     ReferenceVideo,
 )
@@ -140,7 +141,7 @@ from vllm_omni.entrypoints.openai.stage_params import (
 from vllm_omni.entrypoints.openai.storage import STORAGE_MANAGER
 from vllm_omni.entrypoints.openai.stores import VIDEO_STORE, VIDEO_TASKS
 from vllm_omni.entrypoints.openai.utils import get_stage_type, parse_lora_request
-from vllm_omni.entrypoints.openai.video_api_utils import decode_audio_url, decode_input_reference
+from vllm_omni.entrypoints.openai.video_api_utils import decode_audio_url, decode_image_url, decode_input_reference
 from vllm_omni.entrypoints.openpi.serving import ServingRealtimeRobotOpenPI
 from vllm_omni.errors import OmniClientError
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniTextPrompt
@@ -2702,9 +2703,11 @@ async def _run_video_generation_job(
     handler: OmniOpenAIServingVideo,
     request: VideoGenerationRequest,
     video_id: str,
+    *,
     reference_image: ReferenceImage | None = None,
     reference_video: ReferenceVideo | None = None,
     reference_audio: ReferenceAudio | None = None,
+    reference_conditions: list[ReferenceConditionAnchor] | None = None,
     app_state: Any | None = None,
 ) -> None:
     job = await VIDEO_STORE.get(video_id)
@@ -2722,6 +2725,7 @@ async def _run_video_generation_job(
             reference_image=reference_image,
             reference_video=reference_video,
             reference_audio=reference_audio,
+            reference_conditions=reference_conditions,
         )
 
         file_name = f"{video_id}.{job.file_extension}"
@@ -2786,6 +2790,24 @@ async def _run_video_generation_job(
 VIDEO_SYNC_TIMEOUT_S = float(os.environ.get("VLLM_OMNI_VIDEO_SYNC_TIMEOUT", 600.0))
 
 
+@dataclasses.dataclass
+class ParsedVideoForm:
+    """Parsed multipart form for ``POST /v1/videos`` and ``/v1/videos/sync``.
+
+    A small wrapper around the decoded form so the endpoints can name what they
+    consume (``ctx.conditions``) rather than positional-unpacking a growing
+    tuple every time a new reference modality lands.
+    """
+
+    request: VideoGenerationRequest
+    handler: "OmniOpenAIServingVideo"
+    effective_model_name: str
+    reference_image: ReferenceImage | None
+    reference_video: ReferenceVideo | None
+    reference_audio: ReferenceAudio | None
+    reference_conditions: list[ReferenceConditionAnchor] | None
+
+
 async def _parse_video_form(
     raw_request: Request,
     prompt: str = Form(...),
@@ -2817,14 +2839,8 @@ async def _parse_video_form(
     frame_interpolation_model_path: str | None = Form(default=None),
     lora: str | None = Form(default=None),
     extra_params: str | None = Form(default=None),
-) -> tuple[
-    VideoGenerationRequest,
-    "OmniOpenAIServingVideo",
-    str,
-    ReferenceImage | None,
-    ReferenceVideo | None,
-    ReferenceAudio | None,
-]:
+    conditions: str | None = Form(default=None),
+) -> ParsedVideoForm:
     """FastAPI dependency that parses video form data, validates inputs,
     resolves the handler, and decodes any reference image.
 
@@ -2873,6 +2889,7 @@ async def _parse_video_form(
         "frame_interpolation_model_path": frame_interpolation_model_path,
         "lora": _parse_form_json(lora, expected_type=dict),
         "extra_params": _parse_form_json(extra_params, expected_type=dict),
+        "conditions": _parse_form_json(conditions, expected_type=list),
     }
     request_data = {k: v for k, v in request_data.items() if v is not None}
     request = VideoGenerationRequest(**request_data)
@@ -2935,7 +2952,29 @@ async def _parse_video_form(
             raise HTTPException(400, detail=str(exc)) from exc
         reference_audio = ReferenceAudio(path=audio_path)
 
-    return request, handler, effective_model_name, reference_image, reference_video, reference_audio
+    reference_conditions: list[ReferenceConditionAnchor] | None = None
+    if request.conditions:
+        try:
+            reference_conditions = [
+                ReferenceConditionAnchor(
+                    data=await decode_image_url(anchor.image_url),
+                    index=anchor.index,
+                    strength=anchor.strength,
+                )
+                for anchor in request.conditions
+            ]
+        except InvalidInputReferenceError as exc:
+            raise HTTPException(400, detail=str(exc) or "Invalid condition anchor.") from exc
+
+    return ParsedVideoForm(
+        request=request,
+        handler=handler,
+        effective_model_name=effective_model_name,
+        reference_image=reference_image,
+        reference_video=reference_video,
+        reference_audio=reference_audio,
+        reference_conditions=reference_conditions,
+    )
 
 
 @router.post(
@@ -2949,31 +2988,24 @@ async def _parse_video_form(
 )
 async def create_video(
     raw_request: Request,
-    ctx: tuple[
-        VideoGenerationRequest,
-        OmniOpenAIServingVideo,
-        str,
-        ReferenceImage | None,
-        ReferenceVideo | None,
-        ReferenceAudio | None,
-    ] = Depends(_parse_video_form),
+    ctx: ParsedVideoForm = Depends(_parse_video_form),
 ) -> VideoResponse:
     """Create an asynchronous video generation job.
 
     Accepts multipart form-data (see ``_parse_video_form`` for parameters),
     persists a queued job record, and starts generation in the background.
     """
-    request, handler, effective_model_name, reference_image, reference_video, reference_audio = ctx
-    ref = video_response_from_request(effective_model_name, request)
+    ref = video_response_from_request(ctx.effective_model_name, ctx.request)
     await VIDEO_STORE.upsert(ref.id, ref)
     task = asyncio.create_task(
         _run_video_generation_job(
-            handler,
-            request,
+            ctx.handler,
+            ctx.request,
             ref.id,
-            reference_image,
-            reference_video,
-            reference_audio,
+            reference_image=ctx.reference_image,
+            reference_video=ctx.reference_video,
+            reference_audio=ctx.reference_audio,
+            reference_conditions=ctx.reference_conditions,
             app_state=raw_request.app.state,
         )
     )
@@ -2992,14 +3024,7 @@ async def create_video(
 )
 async def create_video_sync(
     raw_request: Request,
-    ctx: tuple[
-        VideoGenerationRequest,
-        OmniOpenAIServingVideo,
-        str,
-        ReferenceImage | None,
-        ReferenceVideo | None,
-        ReferenceAudio | None,
-    ] = Depends(_parse_video_form),
+    ctx: ParsedVideoForm = Depends(_parse_video_form),
 ) -> Response:
     """Synchronous video generation endpoint.
 
@@ -3010,18 +3035,18 @@ async def create_video_sync(
     Metadata is returned via response headers ``X-Request-Id``,
     ``X-Model``, and ``X-Inference-Time-S``.
     """
-    request, handler, effective_model_name, reference_image, reference_video, reference_audio = ctx
     request_id = f"video_sync-{random_uuid()}"
     raw_request.state.request_metadata = RequestResponseMetadata(request_id=request_id)
     started_at = time.perf_counter()
     try:
         video_bytes, stage_durations, peak_memory_mb, _action = await asyncio.wait_for(
-            handler.generate_video_bytes(
-                request,
+            ctx.handler.generate_video_bytes(
+                ctx.request,
                 request_id,
-                reference_image=reference_image,
-                reference_video=reference_video,
-                reference_audio=reference_audio,
+                reference_image=ctx.reference_image,
+                reference_video=ctx.reference_video,
+                reference_audio=ctx.reference_audio,
+                reference_conditions=ctx.reference_conditions,
             ),
             timeout=VIDEO_SYNC_TIMEOUT_S,
         )
@@ -3044,8 +3069,8 @@ async def create_video_sync(
             detail=f"Video generation failed: {str(exc)}",
         ) from exc
     finally:
-        if reference_audio is not None and os.path.exists(reference_audio.path):
-            os.unlink(reference_audio.path)
+        if ctx.reference_audio is not None and os.path.exists(ctx.reference_audio.path):
+            os.unlink(ctx.reference_audio.path)
     inference_time_s = time.perf_counter() - started_at
 
     return Response(
@@ -3053,7 +3078,7 @@ async def create_video_sync(
         media_type="video/mp4",
         headers={
             "X-Request-Id": request_id,
-            "X-Model": effective_model_name,
+            "X-Model": ctx.effective_model_name,
             "X-Inference-Time-S": f"{inference_time_s:.3f}",
             "X-Stage-Durations": json.dumps(stage_durations, separators=(",", ":")),
             "X-Peak-Memory-MB": f"{peak_memory_mb:.3f}",

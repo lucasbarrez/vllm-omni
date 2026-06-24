@@ -94,6 +94,42 @@ class UrlAudioReference(BaseModel):
 AudioReference = UrlAudioReference
 
 
+class VideoConditionAnchor(BaseModel):
+    """One anchor in a multi-anchor frame conditioning request (FLF2V / FMLF).
+
+    Used by pipelines that accept a list of frames anchored at specific latent
+    indices (e.g. ``LTX23ConditionPipeline``). Each anchor pins the latent at
+    ``index`` to the image at ``image_url`` with the given ``strength``.
+
+    Mirrors the :class:`ImageReference` convention: ``image_url`` accepts
+    ``data:`` URLs (base64), ``http(s)://`` URLs, and ``file_id:`` references
+    (forward-compatible with a future Files API).
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    image_url: str = Field(
+        ...,
+        description=(
+            "Image source for this anchor. Accepts a data: URL (base64), "
+            "http(s):// URL, or file_id: reference."
+        ),
+    )
+    index: int = Field(
+        ...,
+        description=(
+            "Latent frame index where this anchor lives. Negative values are "
+            "resolved from the end (e.g., -1 = last latent frame)."
+        ),
+    )
+    strength: float = Field(
+        default=1.0,
+        ge=0.0,
+        le=1.0,
+        description="Per-anchor conditioning strength (1.0 = hard pin, 0.0 = no-op).",
+    )
+
+
 class VideoGenerationRequest(BaseModel):
     """
     OpenAI-style video generation request.
@@ -127,6 +163,16 @@ class VideoGenerationRequest(BaseModel):
     audio_reference: AudioReference | None = Field(
         default=None,
         description="Optional audio reference for speech-to-video. Provide audio_url (http(s) or data URL).",
+    )
+
+    conditions: list[VideoConditionAnchor] | None = Field(
+        default=None,
+        description=(
+            "Multi-anchor frame conditioning (FLF2V / FMLF). Each entry pins "
+            "the latent at `index` to the image at `image_url` with `strength`. "
+            "Consumed by pipelines that support multi-anchor conditioning "
+            "(e.g., `LTX23ConditionPipeline`)."
+        ),
     )
 
     # Video params block for extensibility

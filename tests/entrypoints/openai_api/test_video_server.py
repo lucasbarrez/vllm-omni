@@ -1097,6 +1097,39 @@ def test_video_request_validation():
         VideoGenerationRequest(prompt="test", sound_duration=0)
 
 
+def test_video_request_conditions_validation():
+    # Valid: multi-anchor FMLF (first, middle, last) with mixed strengths.
+    req = VideoGenerationRequest(
+        prompt="cat plays",
+        conditions=[
+            {"image_url": "https://example.com/a.jpg", "index": 0, "strength": 1.0},
+            {"image_url": "data:image/png;base64,iVBORw0KGgo=", "index": 12, "strength": 0.7},
+            {"image_url": "https://example.com/c.jpg", "index": -1},
+        ],
+    )
+    assert req.conditions is not None
+    assert [a.index for a in req.conditions] == [0, 12, -1]
+    assert req.conditions[2].strength == 1.0  # default
+
+    # strength out of range
+    with pytest.raises(ValueError):
+        VideoGenerationRequest(
+            prompt="x",
+            conditions=[{"image_url": "https://e.com/a.jpg", "index": 0, "strength": 1.5}],
+        )
+
+    # missing image_url
+    with pytest.raises(ValueError):
+        VideoGenerationRequest(prompt="x", conditions=[{"index": 0}])
+
+    # extra field is rejected (extra="forbid")
+    with pytest.raises(ValueError):
+        VideoGenerationRequest(
+            prompt="x",
+            conditions=[{"image_url": "https://e.com/a.jpg", "index": 0, "weight": 1.0}],
+        )
+
+
 def test_list_videos_supports_order_after_and_limit(test_client, mocker: MockerFixture):
     mocker.patch(
         "vllm_omni.entrypoints.openai.serving_video._encode_video_bytes",
