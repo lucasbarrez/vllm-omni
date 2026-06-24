@@ -5,7 +5,9 @@
 ## Summary
 
 - Vendor: Lightricks
-- Model: `dg845/LTX-2.3-Diffusers`
+- Models:
+  - `dg845/LTX-2.3-Diffusers` (full BF16, 30-step)
+  - `diffusers/LTX-2.3-Distilled-Diffusers` (Lightricks 8-step distilled, CFG disabled)
 - Task: Text-to-video with synchronized audio generation
 - Mode: Online serving (pure diffusion)
 - Maintainer: @oglok
@@ -18,9 +20,14 @@ with 48kHz audio, all from a single text prompt. Requires a GPU with at least
 96GB VRAM due to the 22B parameter transformer (~44GB weights) plus text
 encoder, VAE, and vocoder components.
 
+For latency-bound deployments, use the Lightricks-distilled variant
+(`LTX23DistilledPipeline`): 8 inference steps with CFG disabled instead of 30
+steps with CFG=4.0 — same architecture, materially faster, no extra dependencies.
+
 ## References
 
-- Model: <https://huggingface.co/dg845/LTX-2.3-Diffusers>
+- Full model: <https://huggingface.co/dg845/LTX-2.3-Diffusers>
+- Distilled model: <https://huggingface.co/diffusers/LTX-2.3-Distilled-Diffusers>
 - Requires `diffusers >= 0.38.0` (install from git: `pip install git+https://github.com/huggingface/diffusers.git`)
 
 ## Serving
@@ -33,6 +40,21 @@ vllm serve dg845/LTX-2.3-Diffusers \
   --model-class-name LTX23Pipeline \
   --stage-init-timeout 600
 ```
+
+For the Lightricks 8-step distilled variant:
+
+```bash
+vllm serve diffusers/LTX-2.3-Distilled-Diffusers \
+  --omni \
+  --model-class-name LTX23DistilledPipeline \
+  --stage-init-timeout 600
+```
+
+The distilled pipeline composes `LightricksDistilledMixin` on top of
+`LTX23Pipeline` and pins `num_inference_steps=8`, `guidance_scale=1.0`, and the
+Lightricks `DISTILLED_SIGMA_VALUES` schedule. Request-payload overrides for
+these fields are logged and ignored — the schedule and CFG-off contract are
+enforced server-side.
 
 ### Verification
 
@@ -71,6 +93,17 @@ curl -X POST http://localhost:8000/v1/videos \
   -F "size=768x512" \
   -F "num_inference_steps=30" \
   -F "guidance_scale=4.0"
+
+# Distilled variant: 3-second video, 8 steps, CFG disabled
+# (num_inference_steps and guidance_scale fields are silently coerced
+# to 8 / 1.0 by LightricksDistilledMixin — they do NOT need to be sent.)
+curl -X POST http://localhost:8000/v1/videos \
+  -F "prompt=A majestic bald eagle soaring over a misty mountain valley at dawn, golden sunlight breaking through clouds" \
+  -F "model=diffusers/LTX-2.3-Distilled-Diffusers" \
+  -F "num_frames=81" \
+  -F "fps=24" \
+  -F "size=768x512" \
+  -F "seed=42"
 ```
 
 ### Notes
@@ -79,11 +112,15 @@ curl -X POST http://localhost:8000/v1/videos \
 - Key flags:
   - `--stage-init-timeout 600`: Required for the initial `torch.compile` warmup (~90-140 seconds on first request)
   - `--model-class-name LTX23Pipeline`: Selects the LTX-2.3 pipeline (not LTX-2)
+  - `--model-class-name LTX23DistilledPipeline`: Selects the Lightricks 8-step distilled variant
 - Audio: 48kHz AAC via BWE vocoder, automatically synced with video
 - CPU offloading: Text encoder (Gemma-3-12B), connectors, VAE, audio VAE, and vocoder stay on CPU and are moved to GPU only when needed
 - Supported resolutions: 768x512, 512x384 (must be divisible by 32)
 - Frame rate: 24 fps
 - Duration: Controlled by `num_frames` (frames = duration_seconds * 24 + 1)
+- Distilled variant constraints:
+  - CFG is disabled (`guidance_scale=1.0`); `cfg_parallel_size > 1` is not supported
+  - `num_inference_steps` and `guidance_scale` request fields are sanitized to the distilled contract (8 / 1.0) with a warning per dropped field
 - Known limitations:
   - No image-to-video support yet (LTX23ImageToVideoPipeline is a placeholder)
   - Requires `diffusers >= 0.38.0` (not yet on PyPI, install from git)

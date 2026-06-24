@@ -913,3 +913,272 @@ class TestAudioLatentSPPadding:
                 device=torch.device("cpu"),
                 latents=latents,
             )
+
+
+class TestLightricksDistilledMixin:
+    """Tests for the reusable Lightricks step-distillation mixin.
+
+    Verifies that the mixin alone (composed with any base) injects the
+    distilled defaults correctly. This is what guarantees future LTX-2.3 mode
+    pipelines (I2V, Condition, ...) can derive a distilled variant in 3 lines.
+    """
+
+    def test_mixin_exported_from_ltx2_package(self):
+        from vllm_omni.diffusion.models import ltx2
+
+        assert hasattr(ltx2, "LightricksDistilledMixin")
+        assert "LightricksDistilledMixin" in ltx2.__all__
+
+    @staticmethod
+    def _make_sampling_params(**overrides):
+        defaults = dict(
+            num_inference_steps=None,
+            guidance_scale=1.0,
+            guidance_scale_provided=False,
+            do_classifier_free_guidance=False,
+        )
+        defaults.update(overrides)
+        return SimpleNamespace(**defaults)
+
+    @classmethod
+    def _make_request(cls, *, is_dummy_run: bool = False, **sampling_overrides):
+        """Build a request namespace shaped like the production OmniDiffusionRequest.
+
+        The mixin's forward branches on ``req.is_dummy_run()`` to skip sanitize
+        on the engine's warmup pass, so tests must provide that callable.
+        """
+        return SimpleNamespace(
+            sampling_params=cls._make_sampling_params(**sampling_overrides),
+            is_dummy_run=lambda: is_dummy_run,
+        )
+
+    def test_mixin_injects_defaults_on_arbitrary_base(self):
+        """Compose the mixin with a stub base; defaults must flow to super().forward."""
+        from diffusers.pipelines.ltx2.utils import DISTILLED_SIGMA_VALUES
+
+        from vllm_omni.diffusion.models.ltx2.distilled_mixin import LightricksDistilledMixin
+
+        captured: dict = {}
+
+        class _Base:
+            def forward(self, req, sigmas=None, num_inference_steps=None, guidance_scale=4.0, **kwargs):
+                captured["sigmas"] = sigmas
+                captured["num_inference_steps"] = num_inference_steps
+                captured["guidance_scale"] = guidance_scale
+                return SimpleNamespace(output=("v", "a"))
+
+        class _Composed(LightricksDistilledMixin, _Base):
+            pass
+
+        req = self._make_request()
+        _Composed().forward(req)
+
+        assert captured["sigmas"] is DISTILLED_SIGMA_VALUES
+        assert captured["num_inference_steps"] == 8
+        assert captured["guidance_scale"] == 1.0
+
+    def test_mixin_sigmas_kwarg_override_is_respected(self):
+        """Caller can swap the sigma schedule (e.g. for ablation), but num_inference_steps
+        and guidance_scale kwargs are dropped — they belong to the distilled contract."""
+        from vllm_omni.diffusion.models.ltx2.distilled_mixin import LightricksDistilledMixin
+
+        captured: dict = {}
+
+        class _Base:
+            def forward(self, req, sigmas=None, num_inference_steps=None, guidance_scale=4.0, **kwargs):
+                captured["sigmas"] = sigmas
+                captured["num_inference_steps"] = num_inference_steps
+                captured["guidance_scale"] = guidance_scale
+                return SimpleNamespace(output=("v", "a"))
+
+        class _Composed(LightricksDistilledMixin, _Base):
+            pass
+
+        req = self._make_request()
+        _Composed().forward(req, sigmas=[0.9, 0.4], num_inference_steps=12, guidance_scale=3.5)
+
+        assert captured["sigmas"] == [0.9, 0.4]
+        assert captured["num_inference_steps"] == 8
+        assert captured["guidance_scale"] == 1.0
+
+    def test_mixin_sanitizes_request_payload_overrides(self, caplog):
+        """A user POSTing guidance_scale=4.0 + num_inference_steps=30 via the HTTP layer
+        must NOT be able to break the distilled defaults. The base pipeline reads from
+        req.sampling_params (winning over forward kwargs), so the mixin scrubs the
+        request in place and logs a warning per dropped field."""
+        from diffusers.pipelines.ltx2.utils import DISTILLED_SIGMA_VALUES
+
+        from vllm_omni.diffusion.models.ltx2.distilled_mixin import LightricksDistilledMixin
+
+        captured: dict = {}
+
+        class _Base:
+            def forward(self, req, sigmas=None, num_inference_steps=None, guidance_scale=4.0, **kwargs):
+                captured["sigmas"] = sigmas
+                captured["num_inference_steps"] = num_inference_steps
+                captured["guidance_scale"] = guidance_scale
+                captured["req_num_steps"] = req.sampling_params.num_inference_steps
+                captured["req_guidance"] = req.sampling_params.guidance_scale
+                captured["req_provided"] = req.sampling_params.guidance_scale_provided
+                captured["req_cfg"] = req.sampling_params.do_classifier_free_guidance
+                return SimpleNamespace(output=("v", "a"))
+
+        class _Composed(LightricksDistilledMixin, _Base):
+            pass
+
+        req = self._make_request(
+            num_inference_steps=30,
+            guidance_scale=4.0,
+            guidance_scale_provided=True,
+            do_classifier_free_guidance=True,
+        )
+
+        with caplog.at_level("WARNING", logger="vllm_omni.diffusion.models.ltx2.distilled_mixin"):
+            _Composed().forward(req)
+
+        assert captured["sigmas"] is DISTILLED_SIGMA_VALUES
+        assert captured["num_inference_steps"] == 8
+        assert captured["guidance_scale"] == 1.0
+        # Request was scrubbed in place — base pipeline now reads safe values.
+        assert captured["req_num_steps"] == 8
+        assert captured["req_guidance"] == 1.0
+        assert captured["req_provided"] is False
+        assert captured["req_cfg"] is False
+        # One warning per dropped field.
+        warnings = [r.message for r in caplog.records if r.levelname == "WARNING"]
+        assert any("num_inference_steps=30" in m for m in warnings)
+        assert any("guidance_scale=4.00" in m for m in warnings)
+
+    def test_mixin_skips_warnings_when_request_matches_distilled_contract(self, caplog):
+        """No warning should be logged when the user did not override the defaults."""
+        from vllm_omni.diffusion.models.ltx2.distilled_mixin import LightricksDistilledMixin
+
+        class _Base:
+            def forward(self, req, **kwargs):
+                return SimpleNamespace(output=("v", "a"))
+
+        class _Composed(LightricksDistilledMixin, _Base):
+            pass
+
+        req = self._make_request(num_inference_steps=8)
+
+        with caplog.at_level("WARNING", logger="vllm_omni.diffusion.models.ltx2.distilled_mixin"):
+            _Composed().forward(req)
+
+        assert not [r for r in caplog.records if r.levelname == "WARNING"]
+
+    def test_mixin_bypasses_sanitize_for_engine_warmup_dummy_run(self, caplog):
+        """The engine's internal dummy warmup pass uses num_inference_steps=1
+        and guidance_scale=0.0 on purpose to keep cold-start cheap. The mixin
+        must NOT sanitize that path — forcing 8 steps would multiply warmup
+        cost without benefit, and the warning would mislead users into
+        thinking a client sent num_steps=1."""
+        from vllm_omni.diffusion.models.ltx2.distilled_mixin import LightricksDistilledMixin
+
+        captured: dict = {}
+
+        class _Base:
+            def forward(self, req, sigmas=None, num_inference_steps=None, guidance_scale=4.0, **kwargs):
+                captured["sigmas"] = sigmas
+                captured["num_inference_steps"] = num_inference_steps
+                captured["guidance_scale"] = guidance_scale
+                captured["req_num_steps"] = req.sampling_params.num_inference_steps
+                captured["req_guidance"] = req.sampling_params.guidance_scale
+                return SimpleNamespace(output=("v", "a"))
+
+        class _Composed(LightricksDistilledMixin, _Base):
+            pass
+
+        # Mirror what DiffusionEngine._dummy_run constructs.
+        req = SimpleNamespace(
+            sampling_params=self._make_sampling_params(num_inference_steps=1, guidance_scale=0.0),
+            is_dummy_run=lambda: True,
+        )
+
+        with caplog.at_level("WARNING", logger="vllm_omni.diffusion.models.ltx2.distilled_mixin"):
+            _Composed().forward(req, num_inference_steps=1, guidance_scale=0.0)
+
+        # No warnings: the warmup path is exempt by design.
+        assert not [r for r in caplog.records if r.levelname == "WARNING"]
+        # Sanitize was skipped: the request keeps its warmup-minimal values.
+        assert captured["req_num_steps"] == 1
+        assert captured["req_guidance"] == 0.0
+        # Base receives the warmup's own kwargs untouched (mixin did not force 8 / 1.0).
+        assert captured["num_inference_steps"] == 1
+        assert captured["guidance_scale"] == 0.0
+
+
+class TestLTX23DistilledPipeline:
+    """Tests for the LTX-2.3 Lightricks-distilled T2V variant.
+
+    Covers registry wiring, package exports, MRO ordering, and the inherited
+    default injection behavior — most of the forward-behavior coverage lives
+    in :class:`TestLightricksDistilledMixin`.
+    """
+
+    def test_subclasses_ltx23_pipeline(self):
+        from vllm_omni.diffusion.models.ltx2.pipeline_ltx2_3 import LTX23DistilledPipeline, LTX23Pipeline
+
+        assert issubclass(LTX23DistilledPipeline, LTX23Pipeline)
+
+    def test_mixin_appears_before_base_in_mro(self):
+        """LightricksDistilledMixin must be in front of LTX23Pipeline so its
+        forward() wins resolution and the super() chain reaches the base."""
+        from vllm_omni.diffusion.models.ltx2.distilled_mixin import LightricksDistilledMixin
+        from vllm_omni.diffusion.models.ltx2.pipeline_ltx2_3 import LTX23DistilledPipeline, LTX23Pipeline
+
+        mro = LTX23DistilledPipeline.__mro__
+        assert mro.index(LightricksDistilledMixin) < mro.index(LTX23Pipeline)
+
+    def test_registered_in_diffusion_models(self):
+        from vllm_omni.diffusion.registry import _DIFFUSION_MODELS
+
+        assert _DIFFUSION_MODELS["LTX23DistilledPipeline"] == (
+            "ltx2",
+            "pipeline_ltx2_3",
+            "LTX23DistilledPipeline",
+        )
+
+    def test_post_process_func_registered(self):
+        from vllm_omni.diffusion.registry import _DIFFUSION_POST_PROCESS_FUNCS
+
+        assert _DIFFUSION_POST_PROCESS_FUNCS["LTX23DistilledPipeline"] == "get_ltx2_post_process_func"
+
+    def test_exported_from_ltx2_package(self):
+        from vllm_omni.diffusion.models import ltx2
+
+        assert hasattr(ltx2, "LTX23DistilledPipeline")
+        assert "LTX23DistilledPipeline" in ltx2.__all__
+
+    def test_forward_injects_distilled_defaults_via_mixin(self, monkeypatch):
+        """Defaults flow through LTX23Pipeline.forward via the mixin's super() call."""
+        from diffusers.pipelines.ltx2.utils import DISTILLED_SIGMA_VALUES
+
+        from vllm_omni.diffusion.models.ltx2.pipeline_ltx2_3 import LTX23DistilledPipeline, LTX23Pipeline
+
+        captured: dict = {}
+
+        def fake_super_forward(self, req, sigmas=None, num_inference_steps=None, guidance_scale=4.0, **kwargs):
+            captured["sigmas"] = sigmas
+            captured["num_inference_steps"] = num_inference_steps
+            captured["guidance_scale"] = guidance_scale
+            return SimpleNamespace(output=("video", "audio"))
+
+        monkeypatch.setattr(LTX23Pipeline, "forward", fake_super_forward)
+
+        pipe = object.__new__(LTX23DistilledPipeline)
+        req = SimpleNamespace(
+            sampling_params=SimpleNamespace(
+                num_inference_steps=None,
+                guidance_scale=1.0,
+                guidance_scale_provided=False,
+                do_classifier_free_guidance=False,
+            ),
+            is_dummy_run=lambda: False,
+        )
+
+        pipe.forward(req)
+
+        assert captured["sigmas"] is DISTILLED_SIGMA_VALUES
+        assert captured["num_inference_steps"] == 8
+        assert captured["guidance_scale"] == 1.0
