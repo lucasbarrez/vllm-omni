@@ -1688,6 +1688,10 @@ class LTX23ImageToVideoPipeline(LTX23Pipeline):
         mask_shape = (batch_size, 1, num_frames, height, width)
 
         if latents is not None:
+            # Track whether the 5D path already renoised so the 3D fallback
+            # below does not double-noise a Stage 2 of the two-stage I2V
+            # pipeline (where the upsampled latent is unpacked, ndim==5).
+            already_renoised = False
             if latents.ndim == 5:
                 batch_size, _, num_frames, height, width = latents.shape
                 mask_shape = (batch_size, 1, num_frames, height, width)
@@ -1706,6 +1710,7 @@ class LTX23ImageToVideoPipeline(LTX23Pipeline):
                     self.transformer_spatial_patch_size,
                     self.transformer_temporal_patch_size,
                 )
+                already_renoised = True
             else:
                 conditioning_mask = latents.new_zeros(mask_shape)
                 conditioning_mask[:, :, 0] = 1.0
@@ -1720,7 +1725,9 @@ class LTX23ImageToVideoPipeline(LTX23Pipeline):
                     "Provided `latents` tensor has shape"
                     f" {latents.shape}, but the expected shape is {conditioning_mask.shape + (num_channels_latents,)}."
                 )
-            if noise_scale != 0:
+            if noise_scale != 0 and not already_renoised:
+                # Only fires when the caller passed already-packed (ndim==3)
+                # latents; the 5D path renoises in 5D space before packing.
                 noise = randn_tensor(latents.shape, generator=generator, device=latents.device, dtype=latents.dtype)
                 noise_scale_t = noise_scale * (1 - conditioning_mask).unsqueeze(-1)
                 latents = (1 - noise_scale_t) * latents + noise_scale_t * noise
@@ -2138,7 +2145,11 @@ class LTX23ConditionPipeline(LTX23Pipeline):
         shape = (batch_size, num_channels_latents, latent_num_frames, latent_height, latent_width)
         mask_shape = (batch_size, 1, latent_num_frames, latent_height, latent_width)
 
-        if latents is not None:
+        # Track whether the caller supplied a starting latent; controls the
+        # noise-mixing rule below (fresh init at sigma_max vs SDEdit-style
+        # renoise of a Stage 2 upscaled latent).
+        latents_supplied = latents is not None
+        if latents_supplied:
             latents = self._normalize_latents(
                 latents, self.vae.latents_mean, self.vae.latents_std, self.vae.config.scaling_factor
             )
@@ -2199,12 +2210,20 @@ class LTX23ConditionPipeline(LTX23Pipeline):
             clean_latents = torch.zeros_like(latents)
 
         noise = randn_tensor(latents.shape, generator=generator, device=latents.device, dtype=latents.dtype)
-        # Initial state of the flow at sigma_max: anchor tokens keep the clean
-        # condition latent (pinned by the scheduler step's x0 blend during the
-        # loop); non-anchor tokens start as pure Gaussian noise so the model can
-        # denoise them toward an image. Mirrors the I2V first-frame pattern
-        # (see `prepare_image_to_video_latents`).
-        latents = noise * (1.0 - conditioning_mask) + latents * conditioning_mask
+        if latents_supplied:
+            # SDEdit-style renoise of a caller-provided starting latent (e.g.
+            # Stage 2 of LTX23ConditionTwoStagesPipeline hands the upsampled
+            # Stage 1 latent back in). Mix noise into non-anchor tokens per
+            # ``noise_scale``; anchor tokens are always preserved.
+            noise_scale_t = noise_scale * (1.0 - conditioning_mask)
+            latents = noise_scale_t * noise + (1.0 - noise_scale_t) * latents
+        else:
+            # Fresh init at sigma_max: anchor tokens keep the clean condition
+            # latent (pinned by the scheduler step's x0 blend during the loop);
+            # non-anchor tokens start as pure Gaussian noise so the model can
+            # denoise them toward an image. Mirrors the I2V first-frame
+            # pattern (see ``prepare_image_to_video_latents``).
+            latents = noise * (1.0 - conditioning_mask) + latents * conditioning_mask
 
         return latents, conditioning_mask, clean_latents
 
@@ -2746,6 +2765,7 @@ class LTX23ConditionTwoStagesPipeline(nn.Module, SupportsComponentDiscovery):
             conditions=[],
             latents=upscaled_video_latent,
             audio_latents=audio_latent,
+            noise_scale=STAGE_2_DISTILLED_SIGMA_VALUES[0],
             sigmas=STAGE_2_DISTILLED_SIGMA_VALUES,
             guidance_scale=1.0,
             output_type="np",
