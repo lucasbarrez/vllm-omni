@@ -570,6 +570,25 @@ class LTX23Pipeline(
         return latents
 
     @staticmethod
+    def _create_noised_state(
+        latents: torch.Tensor,
+        noise_scale: float | torch.Tensor,
+        generator: torch.Generator | None = None,
+    ) -> torch.Tensor:
+        """Mix caller-provided latents with Gaussian noise.
+
+        Used on the ``latents is not None`` branch of I2V / Condition
+        ``prepare_*_latents``: stage 2 of the two-stage pipelines hands the
+        upsampled latent in and needs a renoised starting state for the
+        Stage 2 distilled schedule. Mirrors :meth:`LTX2Pipeline._create_noised_state`
+        from the LTX-2 base; carried here because :class:`LTX23Pipeline` is
+        intentionally independent from :class:`LTX2Pipeline` and therefore
+        does not inherit the helper.
+        """
+        noise = randn_tensor(latents.shape, generator=generator, device=latents.device, dtype=latents.dtype)
+        return noise_scale * noise + (1 - noise_scale) * latents
+
+    @staticmethod
     def _normalize_audio_latents(latents: torch.Tensor, latents_mean: torch.Tensor, latents_std: torch.Tensor):
         latents_mean = latents_mean.to(latents.device, latents.dtype)
         latents_std = latents_std.to(latents.device, latents.dtype)
