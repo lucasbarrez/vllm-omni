@@ -2323,7 +2323,11 @@ class LTX23ConditionPipeline(LTX23Pipeline):
         is corrected in x0 space toward ``clean_latents`` weighted by the
         per-token strength before ``scheduler.step``.
         """
-        if not conditions:
+        # ``None`` triggers the request-side resolver (the OpenAI serving
+        # path); an explicit empty list opts out (used by the two-stage
+        # wrappers for Stage 2, where the upscaled latents already carry the
+        # conditioning and re-applying anchors would clobber them).
+        if conditions is None:
             conditions = self._resolve_conditions_from_request(req)
         try:
             self._pending_conditions = conditions or None
@@ -2615,6 +2619,114 @@ class LTX23ImageToVideoTwoStagesPipeline(nn.Module, SupportsComponentDiscovery):
             latents=upscaled_video_latent,
             audio_latents=audio_latent,
             noise_scale=STAGE_2_DISTILLED_SIGMA_VALUES[0],
+            sigmas=STAGE_2_DISTILLED_SIGMA_VALUES,
+            guidance_scale=1.0,
+            output_type="np",
+            return_dict=False,
+        ).output
+
+        return DiffusionOutput(output=(video, audio))
+
+    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+        loader = AutoWeightsLoader(self)
+        return loader.load_weights(weights)
+
+
+class LTX23ConditionTwoStagesPipeline(nn.Module, SupportsComponentDiscovery):
+    """LTX-2.3 multi-anchor condition two-stage pipeline (FLF2V / FMLF, 1080p / 1440p refine).
+
+    Same composition as :class:`LTX23ImageToVideoTwoStagesPipeline` but wraps
+    :class:`LTX23ConditionPipeline` so the first/last/middle-frame anchors
+    drive Stage 1; Stage 2 refines the upscaled latents without re-applying
+    the conditioning (the upscaled latent already carries the anchors and
+    re-applying would clobber them — this mirrors the Diffusers
+    ``LTX2ConditionPipeline`` two-stage pattern, see
+    ``docs/source/en/api/pipelines/ltx2.md`` "Distilled checkpoint generation"
+    + "Condition Pipeline Generation" sections).
+
+    Currently only supports distilled checkpoints — pointing at a dev path
+    raises ``NotImplementedError`` to match the I2V two-stage convention.
+    """
+
+    support_image_input = True
+    dummy_run_num_frames = 2
+
+    _dit_modules: ClassVar[list[str]] = ["pipe.transformer"]
+    _encoder_modules: ClassVar[list[str]] = ["pipe.text_encoder"]
+    _vae_modules: ClassVar[list[str]] = ["pipe.vae", "pipe.audio_vae"]
+
+    def __init__(self, *, od_config: OmniDiffusionConfig, prefix: str = ""):
+        super().__init__()
+        self.device = get_local_device()
+        self.dtype = getattr(od_config, "dtype", torch.bfloat16)
+        self.model_path = od_config.model
+
+        if "distilled" not in os.path.basename(os.path.normpath(self.model_path)).lower():
+            raise NotImplementedError(
+                f"{self.model_path} is not supported for {self.__class__.__name__}: "
+                "LTX-2.3 Condition two-stage currently requires a distilled checkpoint."
+            )
+        self.distilled = True
+
+        self.pipe = LTX23ConditionPipeline(od_config=od_config, prefix=prefix)
+        self.upsample_pipe = LTX2LatentUpsamplePipeline(
+            vae=self.pipe.vae,
+            od_config=od_config,
+            latent_upsampler_model_path=LTX23TwoStagesPipeline._LATENT_UPSAMPLER_REPO,
+        )
+
+        self.lora_manager = DiffusionLoRAManager(
+            pipeline=self.pipe,
+            device=self.device,
+            dtype=self.dtype,
+            max_cached_adapters=od_config.max_cpu_loras,
+        )
+
+        self.weights_sources = [
+            DiffusersPipelineLoader.ComponentSource(
+                model_or_path=od_config.model,
+                subfolder="transformer",
+                revision=None,
+                prefix="pipe.transformer.",
+                fall_back_to_pt=True,
+            ),
+        ]
+
+    @torch.no_grad()
+    def forward(
+        self,
+        req: OmniDiffusionRequest,
+        conditions: list[LTX2VideoCondition] | None = None,
+        **kwargs: Any,
+    ) -> DiffusionOutput:
+        # Stage 1: half-res latent with distilled schedule, anchors active.
+        video_latent, audio_latent = self.pipe(
+            req=req,
+            conditions=conditions,
+            sigmas=DISTILLED_SIGMA_VALUES,
+            output_type="latent",
+            return_dict=False,
+            **kwargs,
+        ).output
+
+        upscaled_video_latent = self.upsample_pipe(
+            latents=video_latent,
+            output_type="latent",
+            return_dict=False,
+        )[0]
+
+        # Stage 2: full-res refine of the upscaled latent. Pass an empty
+        # ``conditions=[]`` to suppress the request-side resolver fallback so
+        # the anchor frames don't get re-baked over the upscaled tokens.
+        stage_2_req = copy.copy(req)
+        stage_2_req.sampling_params = req.sampling_params.clone()
+        stage_2_req.sampling_params.num_inference_steps = len(STAGE_2_DISTILLED_SIGMA_VALUES)
+
+        video, audio = self.pipe(
+            req=stage_2_req,
+            conditions=[],
+            latents=upscaled_video_latent,
+            audio_latents=audio_latent,
             sigmas=STAGE_2_DISTILLED_SIGMA_VALUES,
             guidance_scale=1.0,
             output_type="np",

@@ -2278,3 +2278,45 @@ class TestLTX23ImageToVideoTwoStagesPipeline:
         from vllm_omni.diffusion.models.ltx2.pipeline_ltx2_3 import LTX23ImageToVideoTwoStagesPipeline
 
         assert LTX23ImageToVideoTwoStagesPipeline.support_image_input is True
+
+
+class TestLTX23ConditionTwoStagesPipeline:
+    """Tests for the LTX-2.3 two-stage Condition pipeline (distilled-only)."""
+
+    def test_registered_in_diffusion_models(self):
+        from vllm_omni.diffusion.registry import _DIFFUSION_MODELS
+
+        assert _DIFFUSION_MODELS["LTX23ConditionTwoStagesPipeline"] == (
+            "ltx2",
+            "pipeline_ltx2_3",
+            "LTX23ConditionTwoStagesPipeline",
+        )
+
+    def test_post_process_func_registered(self):
+        from vllm_omni.diffusion.registry import _DIFFUSION_POST_PROCESS_FUNCS
+
+        assert (
+            _DIFFUSION_POST_PROCESS_FUNCS["LTX23ConditionTwoStagesPipeline"]
+            == "get_ltx2_post_process_func"
+        )
+
+    def test_exported_from_ltx2_package(self):
+        from vllm_omni.diffusion.models import ltx2
+
+        assert hasattr(ltx2, "LTX23ConditionTwoStagesPipeline")
+        assert "LTX23ConditionTwoStagesPipeline" in ltx2.__all__
+
+    def test_supports_image_input_class_attribute(self):
+        from vllm_omni.diffusion.models.ltx2.pipeline_ltx2_3 import LTX23ConditionTwoStagesPipeline
+
+        assert LTX23ConditionTwoStagesPipeline.support_image_input is True
+
+    def test_distilled_only_guard(self):
+        """A non-distilled model path must raise NotImplementedError at init time."""
+        from types import SimpleNamespace
+
+        from vllm_omni.diffusion.models.ltx2.pipeline_ltx2_3 import LTX23ConditionTwoStagesPipeline
+
+        od_config = SimpleNamespace(model="dg845/LTX-2.3-Diffusers", max_cpu_loras=1)
+        with pytest.raises(NotImplementedError, match="requires a distilled checkpoint"):
+            LTX23ConditionTwoStagesPipeline(od_config=od_config)
