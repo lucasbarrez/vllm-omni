@@ -2382,6 +2382,10 @@ class LTX23TwoStagesPipeline(nn.Module, SupportsComponentDiscovery):
     _vae_modules: ClassVar[list[str]] = ["pipe.vae", "pipe.audio_vae"]
 
     _STAGE_2_LORA_FILENAME: ClassVar[str] = "ltx-2.3-22b-distilled-lora-384-1.1.safetensors"
+    # LTX-2.3 ships the latent upsampler in a separate Diffusers repo (the main
+    # ``dg845/LTX-2.3-Diffusers`` / ``diffusers/LTX-2.3-Distilled-Diffusers``
+    # repos do not bundle a ``latent_upsampler/`` subfolder, unlike LTX-2).
+    _LATENT_UPSAMPLER_REPO: ClassVar[str] = "dg845/LTX-2.3-Spatial-Upsampler-Diffusers"
 
     def __init__(self, *, od_config: OmniDiffusionConfig, prefix: str = ""):
         super().__init__()
@@ -2391,7 +2395,11 @@ class LTX23TwoStagesPipeline(nn.Module, SupportsComponentDiscovery):
         self.distilled = "distilled" in os.path.basename(os.path.normpath(self.model_path)).lower()
 
         self.pipe = LTX23Pipeline(od_config=od_config, prefix=prefix)
-        self.upsample_pipe = LTX2LatentUpsamplePipeline(vae=self.pipe.vae, od_config=od_config)
+        self.upsample_pipe = LTX2LatentUpsamplePipeline(
+            vae=self.pipe.vae,
+            od_config=od_config,
+            latent_upsampler_model_path=self._LATENT_UPSAMPLER_REPO,
+        )
 
         self.lora_manager = DiffusionLoRAManager(
             pipeline=self.pipe,
@@ -2550,7 +2558,11 @@ class LTX23ImageToVideoTwoStagesPipeline(nn.Module, SupportsComponentDiscovery):
         self.distilled = True
 
         self.pipe = LTX23ImageToVideoPipeline(od_config=od_config, prefix=prefix)
-        self.upsample_pipe = LTX2LatentUpsamplePipeline(vae=self.pipe.vae, od_config=od_config)
+        self.upsample_pipe = LTX2LatentUpsamplePipeline(
+            vae=self.pipe.vae,
+            od_config=od_config,
+            latent_upsampler_model_path=LTX23TwoStagesPipeline._LATENT_UPSAMPLER_REPO,
+        )
 
         self.lora_manager = DiffusionLoRAManager(
             pipeline=self.pipe,

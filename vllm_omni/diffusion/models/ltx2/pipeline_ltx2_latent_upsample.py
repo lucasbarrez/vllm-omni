@@ -22,6 +22,7 @@ class LTX2LatentUpsamplePipeline(nn.Module):
         od_config: OmniDiffusionConfig,
         vae: AutoencoderKLLTX2Video,
         latent_upsampler: LTX2LatentUpsamplerModel = None,
+        latent_upsampler_model_path: str | None = None,
     ) -> None:
         super().__init__()
 
@@ -30,7 +31,13 @@ class LTX2LatentUpsamplePipeline(nn.Module):
         self.vae = vae
 
         self.device = get_local_device()
-        model = od_config.model
+        # ``latent_upsampler_model_path`` lets a wrapping pipeline point at a
+        # dedicated upsampler repo when the main checkpoint does not bundle a
+        # ``latent_upsampler/`` subfolder (e.g. LTX-2.3 ships the upsampler in
+        # ``dg845/LTX-2.3-Spatial-Upsampler-Diffusers``). Defaults to the main
+        # model path, which is the LTX-2 convention where the upsampler lives
+        # alongside the transformer.
+        model = latent_upsampler_model_path or od_config.model
         local_files_only = os.path.exists(model)
 
         if latent_upsampler is None:
