@@ -2753,16 +2753,21 @@ class LTX23ConditionTwoStagesPipeline(nn.Module, SupportsComponentDiscovery):
             return_dict=False,
         )[0]
 
-        # Stage 2: full-res refine of the upscaled latent. Pass an empty
-        # ``conditions=[]`` to suppress the request-side resolver fallback so
-        # the anchor frames don't get re-baked over the upscaled tokens.
+        # Stage 2: full-res refine of the upscaled latent. The conditions are
+        # re-applied here: ``apply_visual_conditioning`` overwrites the anchor
+        # token positions in the upscaled latent with the freshly-VAE-encoded
+        # condition images at the Stage 2 resolution, and builds the
+        # ``conditioning_mask`` that lets the noise mix in
+        # ``prepare_condition_latents`` preserve anchors while only renoising
+        # the rest. Without this the anchors drift toward the model's prior
+        # at Stage 2 (the bird turned "scary mode").
         stage_2_req = copy.copy(req)
         stage_2_req.sampling_params = req.sampling_params.clone()
         stage_2_req.sampling_params.num_inference_steps = len(STAGE_2_DISTILLED_SIGMA_VALUES)
 
         video, audio = self.pipe(
             req=stage_2_req,
-            conditions=[],
+            conditions=conditions,
             latents=upscaled_video_latent,
             audio_latents=audio_latent,
             noise_scale=STAGE_2_DISTILLED_SIGMA_VALUES[0],
