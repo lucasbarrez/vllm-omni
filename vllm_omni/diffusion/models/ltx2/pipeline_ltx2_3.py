@@ -2764,6 +2764,17 @@ class LTX23ConditionTwoStagesPipeline(nn.Module, SupportsComponentDiscovery):
         stage_2_req = copy.copy(req)
         stage_2_req.sampling_params = req.sampling_params.clone()
         stage_2_req.sampling_params.num_inference_steps = len(STAGE_2_DISTILLED_SIGMA_VALUES)
+        # Double the spatial resolution at Stage 2 so condition encoding
+        # matches the upsampled latent. The Diffusers reference passes
+        # ``width=width*2, height=height*2`` explicitly; without it
+        # ``prepare_condition_latents`` re-encodes the anchors at Stage 1's
+        # resolution and the resulting condition tokens (e.g. 1008) do not
+        # line up with the upsampled latent token count (4032 for 2x
+        # spatial upscale at the same temporal resolution).
+        if stage_2_req.sampling_params.width is not None:
+            stage_2_req.sampling_params.width *= 2
+        if stage_2_req.sampling_params.height is not None:
+            stage_2_req.sampling_params.height *= 2
 
         video, audio = self.pipe(
             req=stage_2_req,
